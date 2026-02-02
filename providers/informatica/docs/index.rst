@@ -51,7 +51,7 @@
     :maxdepth: 1
     :caption: Resources
 
-    PyPI Repository <https://pypi.org/project/apache-airflow-providers-openlineage/>
+    PyPI Repository <https://pypi.org/project/apache-airflow-providers-informatica/>
     Installing from sources <installing-providers-from-sources>
 
 .. toctree::
@@ -88,7 +88,7 @@ Installation
 ------------
 
 You can install this package on top of an existing Airflow installation via
-``pip install apache-airflow-providers-openlineage``.
+``pip install apache-airflow-providers-informatica``.
 For the minimum Airflow version supported, see ``Requirements`` below.
 
 
@@ -101,7 +101,7 @@ The minimum Apache Airflow version supported by this provider distribution is ``
 PIP package                                 Version required
 ==========================================  ==================
 ``apache-airflow``                          ``>=3.0.0``
-``apache-airflow-providers-common-sql``     ``>=1.20.0``
-``apache-airflow-providers-common-compat``  ``>=1.4.0``
+``apache-airflow-providers-common-compat``  ``>=1.12.0``
+``apache-airflow-providers-http``           ``>=1.0.0``
 ``attrs``                                   ``>=22.2``
 ==========================================  ==================

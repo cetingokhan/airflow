@@ -34,12 +34,13 @@ class InformaticaProviderPlugin(AirflowPlugin):
     complete and failure and TaskInstances start, complete and failure.
     """
 
+    listeners: list = []
     name: str = "InformaticaProviderPlugin"
+    
     if not is_disabled:
         listeners: list = [get_informatica_listener()]
         hook_lineage_readers: list = [HookLineageReader]
-    else:
-        listeners: list = []
+        
 
     def __init__(self) -> None:
         """Initialize InformaticaProviderPlugin."""

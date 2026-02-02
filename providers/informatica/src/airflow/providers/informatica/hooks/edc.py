@@ -31,7 +31,7 @@ from airflow.providers.http.hooks.http import HttpHook
 if TYPE_CHECKING:
     from requests import Response
 
-    from airflow.models.connection import Connection
+    from airflow.providers.common.compat.sdk import Connection
 
 
 class InformaticaEDCError(RuntimeError):
