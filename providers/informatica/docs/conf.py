@@ -24,4 +24,8 @@ import os
 
 os.environ["AIRFLOW_PACKAGE_NAME"] = "apache-airflow-providers-informatica"
 
-from docs.provider_conf import *  # noqa: F403
+from docs import provider_conf as _provider_conf
+
+for _name in dir(_provider_conf):
+    if not _name.startswith("_"):
+        globals()[_name] = getattr(_provider_conf, _name)

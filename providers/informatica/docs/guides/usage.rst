@@ -103,7 +103,7 @@ Example DAG
    with DAG(
        dag_id="example_informatica_lineage_dag",
        start_date=datetime(2024, 1, 1),
-       schedule_interval=None,
+       schedule=None,
        catchup=False,
    ) as dag:
        python_task = PythonOperator(
