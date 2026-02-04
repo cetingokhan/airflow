@@ -41,7 +41,7 @@ def setup_connections(create_connection_without_db):
     create_connection_without_db(
         Connection(
             conn_id="test_conn",
-            conn_type="http",
+            conn_type="informatica_edc",
             host="testhost",
             schema="https",
             port=443,

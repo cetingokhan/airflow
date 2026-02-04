@@ -64,7 +64,7 @@ def get_provider_info():
                         "description": "The default connection ID to use for Informatica operations.\n",
                         "type": "string",
                         "example": "informatica_edc_default",
-                        "default": "",
+                        "default": "informatica_edc_default",
                         "version_added": None,
                     },
                 },

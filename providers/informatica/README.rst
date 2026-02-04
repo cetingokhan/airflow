@@ -42,7 +42,7 @@ Connection Setup
 
 Create an Informatica EDC connection in Airflow:
 
-    #. **Connection Type**: ``http``
+    #. **Connection Type**: ``informatica_edc``
     #. **Host**: Your EDC server hostname
     #. **Port**: EDC server port (typically 9087)
     #. **Schema**: ``https`` or ``http``
