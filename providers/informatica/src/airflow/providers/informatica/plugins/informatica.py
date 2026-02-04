@@ -30,8 +30,7 @@ class InformaticaProviderPlugin(AirflowPlugin):
     """
     Listener that emits numerous Events.
 
-    Informatica Plugin provides listener that emits OL events on DAG start,
-    complete and failure and TaskInstances start, complete and failure.
+    Informatica Plugin provides listener that emits OL events on DAG.
     """
 
     name: str = "InformaticaProviderPlugin"

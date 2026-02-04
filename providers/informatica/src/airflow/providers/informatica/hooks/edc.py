@@ -171,27 +171,27 @@ class InformaticaEDCHook(HttpHook):
             f"Informatica EDC request to {endpoint} returned {response.status_code}: {message}"
         )
 
-    def _encode_id(self, id, tilde=False):
+    def _encode_id(self, object_id, tilde=False):
         """
         Encode an ID to be safe. Return String.
 
         Parameters
         ----------
-        id : String
+        object_id : String
             ID of object
         tilde : Boolean, optional (default=False)
             Whether to encode with a tilde or percent sign.
         """
-        if ":___" in id:
-            id = id.replace(":___", "://")
+        if ":___" in object_id:
+            object_id = object_id.replace(":___", "://")
 
         regex = re.compile(r"([^a-zA-Z0-9_-])")
 
-        id_lst = list(id)
+        id_lst = list(object_id)
         idx = 0
 
-        while regex.search(id, idx) is not None:
-            idx = regex.search(id, idx).span()[1]
+        while regex.search(object_id, idx) is not None:
+            idx = regex.search(object_id, idx).span()[1]
             if tilde:
                 id_lst[idx - 1] = "~" + str(bytes(id_lst[idx - 1], "utf-8").hex()) + "~"
             else:

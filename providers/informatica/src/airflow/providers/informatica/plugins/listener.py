@@ -31,7 +31,7 @@ _informatica_listener: InformaticaListener | None = None
 
 
 class InformaticaListener:
-    """Informatica listener sends events on task instance and dag run starts, completes and failures."""
+    """Informatica listener sends events on task instance state changes to Informatica EDC for lineage tracking."""
 
     def __init__(self):
         self._executor = None
