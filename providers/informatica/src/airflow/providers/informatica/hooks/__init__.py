@@ -15,6 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from .edc import InformaticaConnectionConfig, InformaticaEDCError
+from airflow.providers.informatica.hooks.edc import InformaticaConnectionConfig, InformaticaEDCError
 
 __all__ = ["InformaticaEDCError", "InformaticaConnectionConfig"]

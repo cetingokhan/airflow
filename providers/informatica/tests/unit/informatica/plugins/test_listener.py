@@ -90,58 +90,6 @@ def test_handle_lineage_non_success_state(listener):
     listener.hook.create_lineage_link.assert_not_called()
 
 
-def test_on_dag_run_running_logs(listener):
-    dag_run = MagicMock(dag_id="dag1", run_id="run1")
-    listener.log = MagicMock()
-    listener.on_dag_run_running(dag_run, msg="running")
-    listener.log.info.assert_called_with(
-        "[InformaticaLineageListener] DAG Run Running: %s run_id=%s msg=%s",
-        "dag1",
-        "run1",
-        "running",
-    )
-
-
-def test_on_dag_run_success_logs(listener):
-    dag_run = MagicMock(dag_id="dag1", run_id="run1")
-    listener.log = MagicMock()
-    listener.on_dag_run_success(dag_run, msg="success")
-    listener.log.info.assert_called_with(
-        "[InformaticaLineageListener] DAG Run Success: %s run_id=%s msg=%s",
-        "dag1",
-        "run1",
-        "success",
-    )
-
-
-def test_on_dag_run_failed_logs(listener):
-    dag_run = MagicMock(dag_id="dag1", run_id="run1")
-    listener.log = MagicMock()
-    listener.on_dag_run_failed(dag_run, msg="failed")
-    listener.log.info.assert_called_with(
-        "[InformaticaLineageListener] DAG Run Failed: %s run_id=%s msg=%s",
-        "dag1",
-        "run1",
-        "failed",
-    )
-
-
-def test_on_starting_logs(listener):
-    component = MagicMock()
-    component.__class__.__name__ = "DummyComponent"
-    listener.log = MagicMock()
-    listener.on_starting(component)
-    listener.log.info.assert_called_with("[InformaticaLineageListener] on_starting: %s", "DummyComponent")
-
-
-def test_before_stopping_logs(listener):
-    component = MagicMock()
-    component.__class__.__name__ = "DummyComponent"
-    listener.log = MagicMock()
-    listener.before_stopping(component)
-    listener.log.info.assert_called_with("[InformaticaLineageListener] before_stopping: %s", "DummyComponent")
-
-
 def test_handle_lineage_link_creation_error_logs(listener):
     listener.hook.get_object.side_effect = lambda x: {"id": x}
     listener.hook.create_lineage_link.side_effect = Exception("fail link")

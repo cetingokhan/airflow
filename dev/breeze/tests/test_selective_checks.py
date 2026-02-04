@@ -782,25 +782,25 @@ def assert_outputs_are_printed(expected_outputs: dict[str, str], stderr: str):
                     "individual-providers-test-types-list-as-strings-in-json": json.dumps(
                         [
                             {
-                                "description": "amazon...atlassian.jir", 
-                                "test_types": "Providers[amazon] Providers[apache.livy] Providers[atlassian.jira]"
-                            }, 
+                                "description": "amazon...atlassian.jir",
+                                "test_types": "Providers[amazon] Providers[apache.livy] Providers[atlassian.jira]",
+                            },
                             {
-                                "description": "common.compat...dbt.cloud", 
-                                "test_types": "Providers[common.compat] Providers[dbt.cloud]"
-                            }, 
+                                "description": "common.compat...dbt.cloud",
+                                "test_types": "Providers[common.compat] Providers[dbt.cloud]",
+                            },
                             {
-                                "description": "dingding...discord", 
-                                "test_types": "Providers[dingding] Providers[discord]"
-                            }, 
+                                "description": "dingding...discord",
+                                "test_types": "Providers[dingding] Providers[discord]",
+                            },
                             {
-                                "description": "google...http", 
-                                "test_types": "Providers[google] Providers[http]"
-                            }, 
+                                "description": "google...http",
+                                "test_types": "Providers[google] Providers[http]",
+                            },
                             {
-                                "description": "informatica...pagerduty", 
-                                "test_types": "Providers[informatica] Providers[pagerduty]"
-                            }
+                                "description": "informatica...pagerduty",
+                                "test_types": "Providers[informatica] Providers[pagerduty]",
+                            },
                         ]
                     ),
                     "run-mypy": "true",

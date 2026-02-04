@@ -49,9 +49,6 @@ The provider consists of several key components:
 **Plugins**
     ``InformaticaProviderPlugin`` registers listeners that monitor task lifecycle events and trigger lineage operations.
 
-**Operators**
-    ``EmptyOperator``: A minimal operator included for basic lineage testing and integration. It supports inlets and outlets, allowing you to verify lineage extraction and EDC integration without custom logic.
-
 **Listeners**
     Event-driven listeners that respond to task success/failure events and process lineage information.
 
@@ -130,24 +127,6 @@ The hook provides low-level access to Informatica EDC API.
    hook = InformaticaEDCHook(informatica_edc_conn_id="my_connection")
    object_data = hook.get_object("edc://object/table_123")
    result = hook.create_lineage_link("source_id", "target_id")
-
-Operators
----------
-
-Empty Operator
-^^^^^^^^^^^^^^
-
-The provider includes an empty operator for basic lineage testing.
-
-.. code-block:: python
-
-   from airflow.providers.informatica.operators import EmptyOperator
-
-   empty_task = EmptyOperator(
-       task_id="empty_task",
-       inlets=[{"dataset_uri": "edc://object/test_table"}],
-       outlets=[{"dataset_uri": "edc://object/result_table"}],
-   )
 
 Plugins and Listeners
 ---------------------

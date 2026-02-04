@@ -22,7 +22,7 @@ from airflow.plugins_manager import AirflowPlugin
 is_disabled = conf.getboolean("informatica", "disabled", fallback=False)
 # Conditional imports - only load expensive dependencies when plugin is enabled
 if not is_disabled:
-    from airflow.lineage.hook import HookLineageReader
+    from airflow.providers.common.compat.sdk import HookLineageReader
     from airflow.providers.informatica.plugins.listener import get_informatica_listener
 
 
@@ -35,10 +35,8 @@ class InformaticaProviderPlugin(AirflowPlugin):
     """
 
     name: str = "InformaticaProviderPlugin"
-    
     listeners: list = [get_informatica_listener()] if not is_disabled else []
     hook_lineage_readers: list = [HookLineageReader] if not is_disabled else []
-        
 
     def __init__(self) -> None:
         """Initialize InformaticaProviderPlugin."""

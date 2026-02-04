@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from airflow import settings
 from airflow.listeners import hookimpl
 from airflow.providers.informatica.extractors import InformaticaLineageExtractor
 from airflow.providers.informatica.hooks.edc import InformaticaEDCHook
@@ -29,20 +28,6 @@ if TYPE_CHECKING:
     from airflow.utils.state import TaskInstanceState
 
 _informatica_listener: InformaticaListener | None = None
-
-
-def _executor_initializer():
-    """
-    Initialize processes for the executor used with DAGRun listener's methods (on scheduler).
-
-    This function must be picklable, so it cannot be defined as an inner method or local function.
-
-    Reconfigures the ORM engine to prevent issues that arise when multiple processes interact with
-    the Airflow database.
-    """
-    # This initializer is used only on the scheduler
-    # We can configure_orm regardless of the Airflow version, as DB access is always allowed from scheduler.
-    settings.configure_orm()
 
 
 class InformaticaListener:
@@ -146,41 +131,6 @@ class InformaticaListener:
                     self.log.exception(
                         "Failed to create lineage link from %s to %s: %s", inlet_id, outlet_id, e
                     )
-
-    @hookimpl
-    def on_dag_run_running(self, dag_run, msg: str):
-        self.log.info(
-            "[InformaticaLineageListener] DAG Run Running: %s run_id=%s msg=%s",
-            getattr(dag_run, "dag_id", None),
-            getattr(dag_run, "run_id", None),
-            msg,
-        )
-
-    @hookimpl
-    def on_dag_run_success(self, dag_run, msg: str):
-        self.log.info(
-            "[InformaticaLineageListener] DAG Run Success: %s run_id=%s msg=%s",
-            getattr(dag_run, "dag_id", None),
-            getattr(dag_run, "run_id", None),
-            msg,
-        )
-
-    @hookimpl
-    def on_dag_run_failed(self, dag_run, msg: str):
-        self.log.info(
-            "[InformaticaLineageListener] DAG Run Failed: %s run_id=%s msg=%s",
-            getattr(dag_run, "dag_id", None),
-            getattr(dag_run, "run_id", None),
-            msg,
-        )
-
-    @hookimpl
-    def on_starting(self, component):
-        self.log.info("[InformaticaLineageListener] on_starting: %s", component.__class__.__name__)
-
-    @hookimpl
-    def before_stopping(self, component):
-        self.log.info("[InformaticaLineageListener] before_stopping: %s", component.__class__.__name__)
 
 
 def get_informatica_listener() -> InformaticaListener:

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from airflow.providers.informatica.hooks.edc import InformaticaEDCHook
+from airflow.providers.informatica.hooks.edc import InformaticaEDCError, InformaticaEDCHook
 
 
 @pytest.fixture
@@ -108,11 +108,10 @@ def test_request_success_and_error(mock_get_conn, hook):
     mock_response.status_code = 400
     mock_response.text = "Bad Request"
     mock_session.request.return_value = mock_response
-    try:
+    with pytest.raises(
+        InformaticaEDCError, match="Informatica EDC request to endpoint returned 400: Bad Request"
+    ):
         hook._request("GET", "endpoint")
-        pytest.fail("Expected exception was not raised")
-    except Exception:
-        pass
 
 
 def test_encode_id(hook):
@@ -146,11 +145,10 @@ def test_create_lineage_link(mock_request, hook):
     result = hook.create_lineage_link("src_id", "tgt_id")
     assert result["success"] is True
     # Error for same source/target
-    try:
+    with pytest.raises(
+        InformaticaEDCError, match="Source and target object identifiers must differ when creating lineage."
+    ):
         hook.create_lineage_link("same_id", "same_id")
-        pytest.fail("Expected exception was not raised")
-    except Exception:
-        pass
 
 
 def test_close_session(hook):

@@ -95,32 +95,6 @@ The ``InformaticaLineageExtractor`` uses an ``InformaticaEDCHook`` to extract li
   Creates a lineage link between source and target objects via the EDC hook.
 
 
-Operators
----------
-
-**EmptyOperator**
-~~~~~~~~~~~~~~~~~
-
-The ``EmptyOperator`` is a no-op operator that can be used to group tasks or test lineage extraction. It supports ``inlets`` and ``outlets`` for lineage tracking.
-
-**Example Usage:**
-
-.. code-block:: python
-
-   from airflow.providers.informatica.operators.empty import EmptyOperator
-
-   empty_task = EmptyOperator(
-       task_id="empty_task",
-       inlets=[{"dataset_uri": "edc://object/test_table"}],
-       outlets=[{"dataset_uri": "edc://object/result_table"}],
-   )
-
-**Key Parameters:**
-
-- ``inlets``: List of input dataset URIs (e.g., Informatica EDC object URIs)
-- ``outlets``: List of output dataset URIs
-
-
 Plugins
 -------
 

@@ -36,10 +36,14 @@ integrations:
     logo: /docs/integration-logos/informatica.png
     tags: [protocol]
 
-operators:
+hooks:
   - integration-name: Informatica
     python-modules:
-      - airflow.providers.informatica.operators.empty
+      - airflow.providers.informatica.hooks.edc
+
+connection-types:
+  - hook-class-name: airflow.providers.informatica.hooks.edc.InformaticaEDCHook
+    connection-type: informatica_edc
 
 plugins:
   - name: informatica

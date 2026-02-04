@@ -179,21 +179,17 @@ class InformaticaEDCHook(HttpHook):
         ----------
         id : String
             ID of object
-        tilde : Boolean, optional (default=True)
+        tilde : Boolean, optional (default=False)
             Whether to encode with a tilde or percent sign.
         """
-        # Replace three underscores with two backslashes
         if ":___" in id:
             id = id.replace(":___", "://")
 
-        # Get REGEX set-up
-        regex = re.compile("([^a-zA-Z0-9-_])")
+        regex = re.compile(r"([^a-zA-Z0-9_-])")
 
-        # Initialize a few variables
         id_lst = list(id)
         idx = 0
 
-        # Replace each unsafe char with "~Hex(Byte(unsafe char))~"
         while regex.search(id, idx) is not None:
             idx = regex.search(id, idx).span()[1]
             if tilde:

@@ -34,10 +34,13 @@ def get_provider_info():
                 "tags": ["protocol"],
             }
         ],
-        "operators": [
+        "hooks": [
+            {"integration-name": "Informatica", "python-modules": ["airflow.providers.informatica.hooks.edc"]}
+        ],
+        "connection-types": [
             {
-                "integration-name": "Informatica",
-                "python-modules": ["airflow.providers.informatica.operators.empty"],
+                "hook-class-name": "airflow.providers.informatica.hooks.edc.InformaticaEDCHook",
+                "connection-type": "informatica_edc",
             }
         ],
         "plugins": [

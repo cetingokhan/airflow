@@ -75,7 +75,7 @@ Complete DAG Example
 .. code-block:: python
 
    from airflow import DAG
-   from airflow.operators.python import PythonOperator
+   from airflow.providers.standard.operators.python import PythonOperator
    from datetime import datetime
 
 
@@ -86,7 +86,7 @@ Complete DAG Example
    with DAG(
        dag_id="example_informatica_lineage_dag",
        start_date=datetime(2024, 1, 1),
-       schedule_interval=None,
+       schedule=None,
        catchup=False,
    ) as dag:
        python_task = PythonOperator(
