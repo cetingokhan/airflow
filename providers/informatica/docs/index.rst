@@ -71,7 +71,6 @@
 Apache Airflow Informatica Provider
 ===================================
 
-**Note:** This provider is not officially maintained or endorsed by Informatica. It is a community-developed integration for Apache Airflow.
 
 The Informatica provider integrates Apache Airflow with Informatica Enterprise Data Catalog (EDC) for advanced data lineage tracking and asset discovery.
 
