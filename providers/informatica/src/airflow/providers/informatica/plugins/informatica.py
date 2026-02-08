@@ -36,7 +36,3 @@ class InformaticaProviderPlugin(AirflowPlugin):
     name: str = "InformaticaProviderPlugin"
     listeners: list = [get_informatica_listener()] if not is_disabled else []
     hook_lineage_readers: list = [HookLineageReader] if not is_disabled else []
-
-    def __init__(self) -> None:
-        """Initialize InformaticaProviderPlugin."""
-        super().__init__()
