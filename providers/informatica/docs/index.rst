@@ -57,13 +57,6 @@
 .. toctree::
     :hidden:
     :maxdepth: 1
-    :caption: System tests
-
-    System Tests <_api/tests/system/informatica/index>
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
     :caption: Commits
 
     Detailed list of commits <commits>
