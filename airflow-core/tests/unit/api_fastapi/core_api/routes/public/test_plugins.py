@@ -36,6 +36,7 @@ class TestGetPlugins:
                 {},
                 14,
                 [
+                    "InformaticaProviderPlugin",
                     "MetadataCollectionPlugin",
                     "OpenLineageProviderPlugin",
                     "databricks_workflow",
@@ -49,15 +50,14 @@ class TestGetPlugins:
                     "priority_weight_strategy_plugin",
                     "test_plugin",
                     "workday_timetable_plugin",
-                    "InformaticaProviderPlugin",
                 ],
             ),
             (
-                {"limit": 3, "offset": 2},
+                {"limit": 3, "offset": 3},
                 14,
                 ["databricks_workflow", "decreasing_priority_weight_strategy_plugin", "edge_executor"],
             ),
-            ({"limit": 1}, 14, ["MetadataCollectionPlugin"]),
+            ({"limit": 1}, 14, ["InformaticaProviderPlugin"]),
         ],
     )
     def test_should_respond_200(
