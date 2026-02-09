@@ -119,14 +119,10 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-      - name: "Download GPG keys"
-        run: |
-          wget -q -O /tmp/KEYS https://dist.apache.org/repos/dist/release/airflow/KEYS
-          gpg --import /tmp/KEYS || true
       - name: "Install hatch"
         run: uv tool install hatch
       - name: "Run integration tests"
-        run: uv tool run --from apache-airflow-breeze pytest -v --color=yes -m integration
+        run: uv tool run --from apache-airflow-breeze pytest -v --color=yes -m integration_tests
         working-directory: ./dev/breeze/
   tests-shared-distributions:
     timeout-minutes: 10
