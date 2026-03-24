@@ -142,6 +142,12 @@ DEVELOPER_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             ],
         },
         {
+            "name": "Run experimental workers",
+            "options": [
+                "--worker-type",
+            ],
+        },
+        {
             "name": "Installing packages after entering shell",
             "options": [
                 "--airflow-constraints-location",
@@ -256,6 +262,12 @@ DEVELOPER_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             ],
         },
         {
+            "name": "Run experimental workers",
+            "options": [
+                "--worker-type",
+            ],
+        },
+        {
             "name": "Installing packages after entering shell",
             "options": [
                 "--airflow-constraints-location",
@@ -347,7 +359,12 @@ DEVELOPER_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
         },
         {
             "name": "Cleaning inventories",
-            "options": ["--clean-build", "--refresh-airflow-inventories"],
+            "options": [
+                "--clean-build",
+                "--clean-inventory-cache",
+                "--refresh-airflow-inventories",
+                "--fail-on-missing-third-party-inventories",
+            ],
         },
         {
             "name": "Filtering options",
