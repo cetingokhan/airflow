@@ -33,6 +33,7 @@ def get_provider_info():
                 "how-to-guide": [
                     "/docs/apache-airflow-providers-common-ai/operators/agent.rst",
                     "/docs/apache-airflow-providers-common-ai/operators/llm.rst",
+                    "/docs/apache-airflow-providers-common-ai/operators/llm_file_analysis.rst",
                     "/docs/apache-airflow-providers-common-ai/operators/llm_branch.rst",
                     "/docs/apache-airflow-providers-common-ai/operators/llm_data_quality.rst",
                     "/docs/apache-airflow-providers-common-ai/operators/llm_sql.rst",
@@ -242,6 +243,7 @@ def get_provider_info():
                 "python-modules": [
                     "airflow.providers.common.ai.operators.agent",
                     "airflow.providers.common.ai.operators.llm",
+                    "airflow.providers.common.ai.operators.llm_file_analysis",
                     "airflow.providers.common.ai.operators.llm_branch",
                     "airflow.providers.common.ai.operators.llm_data_quality",
                     "airflow.providers.common.ai.operators.llm_sql",
@@ -252,6 +254,10 @@ def get_provider_info():
         "task-decorators": [
             {"class-name": "airflow.providers.common.ai.decorators.agent.agent_task", "name": "agent"},
             {"class-name": "airflow.providers.common.ai.decorators.llm.llm_task", "name": "llm"},
+            {
+                "class-name": "airflow.providers.common.ai.decorators.llm_file_analysis.llm_file_analysis_task",
+                "name": "llm_file_analysis",
+            },
             {
                 "class-name": "airflow.providers.common.ai.decorators.llm_branch.llm_branch_task",
                 "name": "llm_branch",
