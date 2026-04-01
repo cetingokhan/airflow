@@ -61,7 +61,7 @@ class DQCheck(BaseModel):
         default="",
         description=(
             "Semantic category of this check. One of: null_check, uniqueness, validity, "
-            "numeric_range, row_count, string_format. Used to sub-group checks within a table "
+            "numeric_range, row_count, string_format, row_level. Used to sub-group checks within a table "
             "so that checks of different natures land in separate SQL queries."
         ),
     )
@@ -71,6 +71,14 @@ class DQCheck(BaseModel):
             "Optional SELECT query that returns the top N rows violating this check. "
             "Populated only for validity/regex/format checks when unexpected collection "
             "is enabled. Pure aggregate checks leave this as null."
+        ),
+    )
+    row_level: bool = Field(
+        default=False,
+        description=(
+            "When True, the query returns raw column values (no aggregation). "
+            "The planner applies the Python-side validator to every returned row "
+            "and aggregates the results into a RowLevelResult."
         ),
     )
 
@@ -117,6 +125,33 @@ class DQPlan(BaseModel):
     def check_names(self) -> list[str]:
         """Flat list of all ``check_name`` values across every group."""
         return [check.check_name for group in self.groups for check in group.checks]
+
+
+@dataclass
+class RowLevelResult:
+    """
+    Aggregated outcome of applying a row-level validator to every row.
+
+    Produced by
+    :meth:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._execute_row_level_group`
+    when a :class:`DQCheck` has ``row_level=True``.
+
+    :param check_name: Corresponds to the user prompt key.
+    :param total: Total number of rows evaluated.
+    :param invalid: Number of rows for which the validator returned ``False``.
+    :param invalid_pct: Fraction of invalid rows (``invalid / total``), or ``0.0``
+        when *total* is zero.
+    :param sample_violations: Up to ``sample_size`` values that failed validation,
+        as strings.
+    :param sample_size: Maximum number of violations collected.
+    """
+
+    check_name: str
+    total: int
+    invalid: int
+    invalid_pct: float
+    sample_violations: list[str]
+    sample_size: int
 
 
 @dataclass

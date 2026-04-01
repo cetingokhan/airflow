@@ -15,11 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Built-in validator factories for :class:`~airflow.providers.common.ai.operators.llm_data_quality.LLMDataQualityOperator`.
+Built-in and custom validator factories for :class:`~airflow.providers.common.ai.operators.llm_data_quality.LLMDataQualityOperator`.
 
 Each factory returns a ``Callable[[Any], bool]`` that can be placed directly in the
 ``validators`` dict alongside plain lambdas.  They are intentionally decoupled from
 the operator so they can be tested and composed independently.
+
+Custom validators can be registered with :func:`register_validator` so that the
+operator automatically injects their ``llm_context`` into the LLM system prompt,
+guiding SQL generation for custom metric types.
 
 Usage::
 
@@ -29,8 +33,10 @@ Usage::
         duplicate_pct_check,
         between_check,
         exact_check,
+        register_validator,
     )
 
+    # Built-in validators
     validators = {
         "email_nulls": null_pct_check(max_pct=0.05),
         "min_customers": row_count_check(min_count=1000),
@@ -39,14 +45,322 @@ Usage::
         "active_flag": exact_check(expected=0),
         "negative_rev": lambda v: v == 0,
     }
+
+
+    # Custom validator with LLM context
+    @register_validator(
+        "freshness_check",
+        llm_context=(
+            "Compute hours since the most recent row. "
+            "SQL pattern: EXTRACT(EPOCH FROM (NOW() - MAX(ts_col))) / 3600.0. "
+            "Returns a DOUBLE representing hours elapsed."
+        ),
+        check_category="freshness",
+    )
+    def freshness_check(*, max_hours: float):
+        def _check(value):
+            return float(value) <= max_hours
+
+        return _check
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
+# ------------------------------------------------------------------
+# Validator registry — allows custom validators with LLM context
+# ------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class ValidatorEntry:
+    """
+    Metadata for a registered validator factory.
+
+    :param factory: Callable that returns a ``Callable[[Any], bool]`` validator.
+    :param llm_context: Optional hint injected into the LLM system prompt so
+        the model knows what SQL metric format this validator expects.
+    :param check_category: Optional custom check category.  When set, the LLM
+        is instructed to use this category for grouping.
+    :param row_level: When ``True`` the LLM is instructed to generate a plain
+        ``SELECT pk, col FROM table`` (no aggregation).  The planner fetches
+        every row and applies the validator callable to each column value,
+        then reports ``{total, invalid, invalid_pct, sample_violations}``.
+    """
+
+    factory: Callable[..., Callable[[Any], bool]]
+    llm_context: str = ""
+    check_category: str = ""
+    row_level: bool = False
+
+
+class ValidatorRegistry:
+    """
+    Registry for reusable validator factories with optional LLM context.
+
+    Validators registered here can carry an ``llm_context`` string that the
+    operator automatically injects into the LLM system prompt, guiding the
+    model to produce SQL that returns the metric format the validator expects.
+
+    A module-level :data:`default_registry` instance is available.  Use the
+    convenience decorator :func:`register_validator` to register into it.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, ValidatorEntry] = {}
+
+    def register(
+        self,
+        name: str,
+        *,
+        llm_context: str = "",
+        check_category: str = "",
+        row_level: bool = False,
+    ) -> Callable[[Callable[..., Callable[[Any], bool]]], Callable[..., Callable[[Any], bool]]]:
+        """
+        Return a decorator that registers a validator factory under *name*.
+
+        :param name: Unique name for this validator.
+        :param llm_context: SQL generation hint injected into the LLM prompt.
+        :param check_category: Custom check category for LLM grouping.
+        :param row_level: When ``True``, the LLM generates a plain SELECT
+            returning raw row values instead of an aggregate query.  The
+            planner applies the validator to each row and aggregates results.
+        :raises ValueError: If *name* is already registered.
+        """
+        if name in self._entries:
+            raise ValueError(
+                f"Validator {name!r} is already registered. "
+                "Use a different name or unregister the existing one first."
+            )
+
+        def _decorator(
+            factory: Callable[..., Callable[[Any], bool]],
+        ) -> Callable[..., Callable[[Any], bool]]:
+            self._entries[name] = ValidatorEntry(
+                factory=factory,
+                llm_context=llm_context,
+                check_category=check_category,
+                row_level=row_level,
+            )
+
+            # Wrap the factory so every closure it returns carries the full set of
+            # introspection attributes.  Factory authors no longer need to stamp these
+            # manually — the decorator handles it automatically.
+            def _wrapped_factory(*args: Any, **kwargs: Any) -> Callable[[Any], bool]:
+                closure = factory(*args, **kwargs)
+                # Build a human-readable call representation.
+                arg_parts = [repr(a) for a in args]
+                kwarg_parts = [f"{k}={v!r}" for k, v in kwargs.items()]
+                call_str = f"{name}({', '.join(arg_parts + kwarg_parts)})"
+                # Stamp only when the factory has not set the attribute explicitly.
+                if not hasattr(closure, "_validator_name"):
+                    closure._validator_name = name  # type: ignore[attr-defined]
+                if not hasattr(closure, "_row_level"):
+                    closure._row_level = row_level  # type: ignore[attr-defined]
+                for k, v in kwargs.items():
+                    if not hasattr(closure, f"_{k}"):
+                        setattr(closure, f"_{k}", v)  # e.g. _max_pct, _min_count
+                if ".<locals>." in closure.__qualname__:
+                    closure.__qualname__ = call_str
+                if "__repr__" not in closure.__dict__:
+                    closure.__repr__ = lambda: call_str  # type: ignore[method-assign]
+                return closure
+
+            # Preserve factory identity attributes on the wrapper.
+            _wrapped_factory._validator_name = name  # type: ignore[attr-defined]
+            _wrapped_factory._llm_context = llm_context  # type: ignore[attr-defined]
+            _wrapped_factory._check_category = check_category  # type: ignore[attr-defined]
+            _wrapped_factory._row_level = row_level  # type: ignore[attr-defined]
+            _wrapped_factory.__name__ = factory.__name__
+            _wrapped_factory.__qualname__ = factory.__qualname__
+            _wrapped_factory.__doc__ = factory.__doc__
+
+            # Update the registry entry to point to the wrapped factory.
+            self._entries[name] = ValidatorEntry(
+                factory=_wrapped_factory,
+                llm_context=llm_context,
+                check_category=check_category,
+                row_level=row_level,
+            )
+            return _wrapped_factory
+
+        return _decorator
+
+    def get(self, name: str) -> ValidatorEntry:
+        """
+        Return the :class:`ValidatorEntry` for *name*.
+
+        :raises KeyError: If *name* is not registered.
+        """
+        try:
+            return self._entries[name]
+        except KeyError:
+            raise KeyError(
+                f"Validator {name!r} is not registered. Available validators: {sorted(self._entries)}"
+            ) from None
+
+    def list_validators(self) -> list[str]:
+        """Return sorted list of all registered validator names."""
+        return sorted(self._entries)
+
+    def is_row_level(self, validator: Callable[[Any], bool]) -> bool:
+        """
+        Return ``True`` when *validator* was produced by a row-level factory.
+
+        Checks the ``_row_level`` attribute set by the factory closure and,
+        as a fallback, the registry entry for the factory name.
+        """
+        if getattr(validator, "_row_level", False):
+            return True
+        factory_name: str | None = getattr(validator, "_validator_name", None)
+        if factory_name and factory_name in self._entries:
+            return self._entries[factory_name].row_level
+        return False
+
+    def build_llm_context(self, validators: dict[str, Callable[[Any], bool]]) -> str:
+        """
+        Collect LLM context strings from all validators that carry one.
+
+        Aggregate and row-level validators are emitted in separate sections so
+        the LLM knows which checks require raw-row SELECTs vs. aggregate queries.
+
+        Checks three sources in order for each validator callable:
+
+        1. Registry entry (if the callable's factory was registered).
+        2. ``_llm_context`` attribute on the callable itself.
+        3. ``llm_context`` attribute on the callable itself.
+
+        :param validators: The ``{check_name: callable}`` dict from the operator.
+        :returns: Combined context string ready for injection into the system prompt,
+            or empty string if no validator carries context.
+        """
+        aggregate_lines: list[str] = []
+        row_level_lines: list[str] = []
+
+        for check_name, validator in validators.items():
+            context = self._resolve_llm_context(validator)
+            if not context:
+                continue
+            if self.is_row_level(validator):
+                row_level_lines.append(f"  - {check_name}: {context}")
+            else:
+                aggregate_lines.append(f"  - {check_name}: {context}")
+
+        if not aggregate_lines and not row_level_lines:
+            return ""
+
+        parts: list[str] = []
+        if aggregate_lines:
+            parts.append(
+                "\nCUSTOM VALIDATOR CONTEXT:\n"
+                "  The following checks have specific metric requirements.\n"
+                "  Generate SQL that returns values matching these descriptions:\n"
+                + "\n".join(aggregate_lines)
+            )
+        if row_level_lines:
+            parts.append(
+                "\nROW-LEVEL CHECKS:\n"
+                "  The following checks require ROW-LEVEL validation.\n"
+                "  For each, generate a SELECT that returns the primary key column(s)\n"
+                "  and the column(s) to validate — do NOT aggregate.\n"
+                "  Set check.row_level = true on these DQCheck entries.\n"
+                "  The Python-side validator will inspect each returned value:\n" + "\n".join(row_level_lines)
+            )
+        return "\n".join(parts) + "\n"
+
+    def _resolve_llm_context(self, validator: Callable[[Any], bool]) -> str:
+        """Resolve LLM context from registry entries or callable attributes."""
+        # Check registry by factory name attribute.
+        factory_name: str | None = getattr(validator, "_validator_name", None)
+        if factory_name and factory_name in self._entries:
+            entry = self._entries[factory_name]
+            if entry.llm_context:
+                return entry.llm_context
+
+        # Fallback: attribute on the callable itself.
+        for attr in ("_llm_context", "llm_context"):
+            context = getattr(validator, attr, None)
+            if context and isinstance(context, str):
+                return context
+
+        return ""
+
+    def unregister(self, name: str) -> None:
+        """
+        Remove a validator from the registry.
+
+        :raises KeyError: If *name* is not registered.
+        """
+        try:
+            del self._entries[name]
+        except KeyError:
+            raise KeyError(f"Validator {name!r} is not registered.") from None
+
+
+default_registry = ValidatorRegistry()
+
+
+def register_validator(
+    name: str,
+    *,
+    llm_context: str = "",
+    check_category: str = "",
+    row_level: bool = False,
+) -> Callable[[Callable[..., Callable[[Any], bool]]], Callable[..., Callable[[Any], bool]]]:
+    """
+    Register a validator factory in the :data:`default_registry`.
+
+    Use as a decorator on a factory function::
+
+        @register_validator(
+            "freshness_check",
+            llm_context="Compute hours since MAX(updated_at). Returns DOUBLE.",
+            check_category="freshness",
+        )
+        def freshness_check(*, max_hours: float):
+            def _check(value):
+                return float(value) <= max_hours
+
+            return _check
+
+    For row-level validation (e.g. TCKN formula)::
+
+        @register_validator(
+            "tckn_check",
+            llm_context="ROW-LEVEL: SELECT pk, tckn_col FROM table. No aggregation.",
+            check_category="row_level",
+            row_level=True,
+        )
+        def tckn_check(*, max_invalid_pct: float = 0.0):
+            def _check_row(value): ...
+
+            return _check_row
+
+    :param name: Unique name for this validator.
+    :param llm_context: SQL generation hint injected into the LLM prompt.
+    :param check_category: Custom check category for LLM grouping.
+    :param row_level: When ``True``, the LLM generates a plain SELECT returning
+        raw column values.  The planner validates each row with the callable.
+    """
+    return default_registry.register(
+        name, llm_context=llm_context, check_category=check_category, row_level=row_level
+    )
+
+
+# ------------------------------------------------------------------
+# Built-in validator factories
+# ------------------------------------------------------------------
+
+
+@register_validator(
+    "null_pct_check",
+    llm_context="Returns null percentage as a float between 0.0 and 1.0. SQL pattern: COUNT(CASE WHEN col IS NULL THEN 1 END) * 1.0 / COUNT(*).",
+    check_category="null_check",
+)
 def null_pct_check(*, max_pct: float) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``value <= max_pct``.
@@ -63,11 +377,14 @@ def null_pct_check(*, max_pct: float) -> Callable[[Any], bool]:
                 f"null_pct_check(max_pct={max_pct!r}): expected a numeric value, got {value!r}"
             ) from exc
 
-    _check.__qualname__ = f"null_pct_check(max_pct={max_pct!r})"
-    _check.__repr__ = lambda: f"null_pct_check(max_pct={max_pct!r})"  # type: ignore[method-assign]
     return _check
 
 
+@register_validator(
+    "row_count_check",
+    llm_context="Returns an integer row count. SQL pattern: COUNT(*).",
+    check_category="row_count",
+)
 def row_count_check(*, min_count: int) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``value >= min_count``.
@@ -84,11 +401,14 @@ def row_count_check(*, min_count: int) -> Callable[[Any], bool]:
                 f"row_count_check(min_count={min_count!r}): expected an integer value, got {value!r}"
             ) from exc
 
-    _check.__qualname__ = f"row_count_check(min_count={min_count!r})"
-    _check.__repr__ = lambda: f"row_count_check(min_count={min_count!r})"  # type: ignore[method-assign]
     return _check
 
 
+@register_validator(
+    "duplicate_pct_check",
+    llm_context="Returns duplicate percentage as a float between 0.0 and 1.0. SQL pattern: (COUNT(*) - COUNT(DISTINCT col)) * 1.0 / COUNT(*).",
+    check_category="uniqueness",
+)
 def duplicate_pct_check(*, max_pct: float) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``value <= max_pct``.
@@ -105,11 +425,14 @@ def duplicate_pct_check(*, max_pct: float) -> Callable[[Any], bool]:
                 f"duplicate_pct_check(max_pct={max_pct!r}): expected a numeric value, got {value!r}"
             ) from exc
 
-    _check.__qualname__ = f"duplicate_pct_check(max_pct={max_pct!r})"
-    _check.__repr__ = lambda: f"duplicate_pct_check(max_pct={max_pct!r})"  # type: ignore[method-assign]
     return _check
 
 
+@register_validator(
+    "between_check",
+    llm_context="Returns a numeric value that will be compared against inclusive bounds. SQL should return a single DOUBLE or INTEGER metric.",
+    check_category="numeric_range",
+)
 def between_check(*, min_val: float, max_val: float) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``min_val <= value <= max_val``.
@@ -131,11 +454,14 @@ def between_check(*, min_val: float, max_val: float) -> Callable[[Any], bool]:
                 f"expected a numeric value, got {value!r}"
             ) from exc
 
-    _check.__qualname__ = f"between_check(min_val={min_val!r}, max_val={max_val!r})"
-    _check.__repr__ = lambda: f"between_check(min_val={min_val!r}, max_val={max_val!r})"  # type: ignore[method-assign]
     return _check
 
 
+@register_validator(
+    "exact_check",
+    llm_context="Returns a value that must exactly equal an expected constant. SQL should return a single scalar metric.",
+    check_category="validity",
+)
 def exact_check(*, expected: Any) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``value == expected``.
@@ -146,6 +472,4 @@ def exact_check(*, expected: Any) -> Callable[[Any], bool]:
     def _check(value: Any) -> bool:
         return value == expected
 
-    _check.__qualname__ = f"exact_check(expected={expected!r})"
-    _check.__repr__ = lambda: f"exact_check(expected={expected!r})"  # type: ignore[method-assign]
     return _check

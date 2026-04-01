@@ -21,13 +21,28 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 from airflow.providers.common.ai.operators.llm import LLMOperator
 from airflow.providers.common.ai.utils.db_schema import get_db_hook
-from airflow.providers.common.ai.utils.dq_models import DQCheckResult, DQPlan, DQReport, UnexpectedResult
-from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner
+from airflow.providers.common.ai.utils.dq_models import (
+    DQCheckGroup,
+    DQCheckResult,
+    DQPlan,
+    DQReport,
+    RowLevelResult,
+    UnexpectedResult,
+)
+from airflow.providers.common.ai.utils.dq_validation import default_registry
 from airflow.providers.common.compat.sdk import AirflowException, Variable
+
+try:
+    from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner
+except ImportError as e:
+    from airflow.providers.common.compat.sdk import AirflowOptionalProviderFeatureException
+
+    raise AirflowOptionalProviderFeatureException(e)
 
 if TYPE_CHECKING:
     from airflow.providers.common.sql.config import DataSourceConfig
@@ -50,8 +65,13 @@ class LLMDataQualityOperator(LLMOperator):
 
     Generated SQL plans are cached in Airflow
     :class:`~airflow.models.variable.Variable` to avoid repeat LLM calls.
-    Set ``dry_run=True`` to preview the plan without executing it — useful
-    for pairing with :class:`~airflow.providers.standard.operators.hitl.ApprovalOperator`.
+    Set ``dry_run=True`` to preview the plan without executing it — the
+    serialised plan dict is returned without running any SQL.
+    Set ``require_approval=True`` to gate execution on human review via the
+    HITL interface: the plan is presented to the reviewer first, and SQL
+    checks run only after approval.  ``dry_run`` and ``require_approval``
+    are independent — enabling both returns the plan dict without any
+    approval prompt.
 
     :param prompts: Mapping of ``{check_name: natural_language_description}``.
         Each key must be unique.  Use one check per key; the operator enforces
@@ -93,6 +113,17 @@ class LLMDataQualityOperator(LLMOperator):
         the resulting sample rows are included in the report.
     :param unexpected_sample_size: Maximum number of violating rows to return
         per failed check.  Default ``100``.
+    :param row_level_sample_size: Maximum number of rows to fetch per row-level
+        check.  ``None`` (default) performs a full table scan — every row is
+        fetched and validated.  A positive integer is passed to the LLM as a
+        ``LIMIT`` clause on the generated SELECT, bounding execution time and
+        memory usage at the cost of sampling coverage.
+    :param require_approval: When ``True``, the operator defers after generating
+        and caching the DQ plan.  The plan SQL is surfaced in the HITL interface
+        for human review; checks run only after the reviewer approves.  Inherited
+        from :class:`~airflow.providers.common.ai.operators.llm.LLMOperator`.
+        ``dry_run=True`` takes precedence — combining both flags returns the plan
+        dict immediately without requesting approval.
     """
 
     template_fields: Sequence[str] = (
@@ -120,6 +151,7 @@ class LLMDataQualityOperator(LLMOperator):
         dry_run: bool = False,
         collect_unexpected: bool = False,
         unexpected_sample_size: int = 100,
+        row_level_sample_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs.pop("output_type", None)
@@ -137,31 +169,32 @@ class LLMDataQualityOperator(LLMOperator):
         self.dq_dry_run = dry_run
         self.collect_unexpected = collect_unexpected
         self.unexpected_sample_size = unexpected_sample_size
-        self._plan_hash: str | None = None
-        if isinstance(self.prompts, dict):
-            self._plan_hash = _compute_plan_hash(self.prompts, self.prompt_version, self.collect_unexpected)
+        self.row_level_sample_size = row_level_sample_size
 
+        self._validate_prompts()
         self._validate_validator_keys()
 
-    def execute(self, context: Context) -> str | dict[str, Any]:
+    def execute(self, context: Context) -> dict[str, Any]:
         """
-        Generate the DQ plan (or load from cache), optionally execute it, and validate results.
+        Generate the DQ plan (or load from cache), then execute or defer for approval.
 
-        :returns: Serialised :class:`~airflow.providers.common.ai.utils.dq_models.DQReport`
-            dict on success, or a markdown preview string when ``dry_run=True``.
+        When ``dry_run=True`` the serialised plan dict is returned immediately —
+        no SQL is executed and no approval is requested.
+        When ``require_approval=True`` the task defers, presenting the plan to a
+        human reviewer; data-quality checks run only after the reviewer approves.
+
+        :returns: Dict with keys ``plan``, ``passed``, and ``results``.  On success
+            ``passed=True`` and ``results`` is a list of per-check result dicts.
+            For row-level checks the ``value`` entry in each result dict is itself
+            a dict with keys ``total``, ``invalid``, ``invalid_pct``, and
+            ``sample_violations`` rather than a raw scalar.
+            When ``dry_run=True`` ``passed=None`` and ``results=None`` — no SQL
+            is executed.  The ``plan`` key is always present in all modes.
         :raises AirflowException: If any data-quality check fails threshold validation.
+        :raises TaskDeferred: When ``require_approval=True``, defers for human review
+            before executing the checks.
         """
-        db_hook = self._resolve_db_hook()
-        planner = SQLDQPlanner(
-            llm_hook=self.llm_hook,
-            db_hook=db_hook,
-            dialect=self.dialect,
-            datasource_config=self.datasource_config,
-            system_prompt=self.system_prompt,
-            agent_params=self.agent_params,
-            collect_unexpected=self.collect_unexpected,
-            unexpected_sample_size=self.unexpected_sample_size,
-        )
+        planner = self._build_planner()
 
         schema_ctx = planner.build_schema_context(
             table_names=self.table_names, schema_context=self.schema_context
@@ -184,12 +217,50 @@ class LLMDataQualityOperator(LLMOperator):
                     ", ".join(c.check_name for c in group.checks),
                     group.query,
                 )
-            return self._build_dry_run_markdown(plan)
+            return {"plan": plan.model_dump(), "passed": None, "results": None}
 
+        if self.require_approval:
+            # Defer BEFORE execution — approval gates the SQL checks.
+            self.defer_for_approval(  # type: ignore[misc]
+                context,
+                plan.model_dump_json(),
+                body=self._build_dry_run_markdown(plan),
+            )
+            return {}  # type: ignore[return-value]  # pragma: no cover
+
+        return self._run_checks_and_report(context, planner, plan)
+
+    def _build_planner(self) -> SQLDQPlanner:
+        """Construct a :class:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner` from operator config."""
+        return SQLDQPlanner(
+            llm_hook=self.llm_hook,
+            db_hook=self.db_hook,
+            dialect=self.dialect,
+            datasource_config=self.datasource_config,
+            system_prompt=self.system_prompt,
+            agent_params=self.agent_params,
+            collect_unexpected=self.collect_unexpected,
+            unexpected_sample_size=self.unexpected_sample_size,
+            validator_contexts=default_registry.build_llm_context(self.validators),
+            row_validators=self._collect_row_validators(),
+            row_level_sample_size=self.row_level_sample_size,
+        )
+
+    def _run_checks_and_report(
+        self,
+        context: Context,
+        planner: SQLDQPlanner,
+        plan: DQPlan,
+    ) -> dict[str, Any]:
+        """
+        Execute *plan* against the database, apply validators, and return the serialised report.
+
+        :raises AirflowException: If any data-quality check fails.
+        """
         results_map = planner.execute_plan(plan)
         check_results = self._validate_results(results_map, plan)
 
-        # Phase 2 — collect unexpected rows for failed validity/format checks.
+        # Collect unexpected rows for failed validity/format checks.
         if self.collect_unexpected:
             failed_names = {r.check_name for r in check_results if not r.passed}
             if failed_names:
@@ -199,12 +270,23 @@ class LLMDataQualityOperator(LLMOperator):
         report = DQReport.build(check_results)
 
         output: dict[str, Any] = {
+            "plan": plan.model_dump(),
             "passed": report.passed,
             "results": [
                 {
                     "check_name": r.check_name,
                     "metric_key": r.metric_key,
-                    "value": r.value,
+                    # RowLevelResult is not JSON-serialisable; convert to a plain dict.
+                    "value": (
+                        {
+                            "total": r.value.total,
+                            "invalid": r.value.invalid,
+                            "invalid_pct": r.value.invalid_pct,
+                            "sample_violations": r.value.sample_violations,
+                        }
+                        if isinstance(r.value, RowLevelResult)
+                        else r.value
+                    ),
                     "passed": r.passed,
                     "failure_reason": r.failure_reason,
                     **(
@@ -230,45 +312,127 @@ class LLMDataQualityOperator(LLMOperator):
         return output
 
     def _build_dry_run_markdown(self, plan: DQPlan) -> str:
-        """Build a markdown summary of grouped SQL checks for dry-run XCom output."""
-        lines = [
-            "# LLM Data Quality Dry Run",
+        """
+        Build a structured markdown summary of the DQ plan for the HITL review body.
+
+        Aggregate groups and row-level groups are rendered in separate sections so
+        reviewers can immediately distinguish SQL-aggregate checks from per-row
+        validation logic.
+        """
+        aggregate_groups = [g for g in plan.groups if not any(c.row_level for c in g.checks)]
+        row_level_groups = [g for g in plan.groups if any(c.row_level for c in g.checks)]
+
+        total_checks = len(plan.check_names)
+        agg_count = sum(len(g.checks) for g in aggregate_groups)
+        row_count = sum(len(g.checks) for g in row_level_groups)
+
+        lines: list[str] = [
+            "# LLM Data Quality Plan",
             "",
-            f"- Plan hash: {plan.plan_hash or 'N/A'}",
-            f"- Groups: {len(plan.groups)}",
-            f"- Checks: {len(plan.check_names)}",
+            "| | |",
+            "|---|---|",
+            f"| **Plan hash** | `{plan.plan_hash or 'N/A'}` |",
+            f"| **Total checks** | {total_checks} |",
+            f"| **Aggregate checks** | {agg_count} ({len(aggregate_groups)} group{'s' if len(aggregate_groups) != 1 else ''}) |",
+            f"| **Row-level checks** | {row_count} ({len(row_level_groups)} group{'s' if len(row_level_groups) != 1 else ''}) |",
             "",
         ]
 
-        for group_index, group in enumerate(plan.groups, start=1):
-            lines.extend(
-                [
-                    f"## Group {group_index}: {group.group_id}",
-                    "",
-                    "### Query",
-                    "",
-                    "```sql",
-                    group.query,
-                    "```",
-                    "",
-                    "### Checks",
-                    "",
-                ]
-            )
-            for check in group.checks:
-                lines.append(f"- {check.check_name} ({check.metric_key})")
-            lines.append("")
+        if aggregate_groups:
+            lines += [
+                "---",
+                "",
+                "## Aggregate Checks",
+                "",
+                "> Each group runs as a **single SQL query**. "
+                "Result columns are matched to check names by metric key.",
+                "",
+            ]
+            for group in aggregate_groups:
+                lines += self._render_aggregate_group(group)
+
+        if row_level_groups:
+            lines += [
+                "---",
+                "",
+                "## Row-Level Checks",
+                "",
+                "> Row-level checks fetch **raw column values** and apply Python-side "
+                "validation per row. The threshold controls the maximum allowed fraction "
+                "of invalid rows before the check fails.",
+                "",
+            ]
+            for group in row_level_groups:
+                lines += self._render_row_level_group(group)
 
         return "\n".join(lines).rstrip()
 
+    def _render_aggregate_group(self, group: DQCheckGroup) -> list[str]:
+        """Render one aggregate SQL group as a markdown subsection."""
+        lines: list[str] = [
+            f"### `{group.group_id}`",
+            "",
+            "| Check name | Metric key | Category |",
+            "|---|---|---|",
+        ]
+        for check in group.checks:
+            category = check.check_category or "—"
+            lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {category} |")
+
+        lines += [
+            "",
+            "```sql",
+            group.query.strip(),
+            "```",
+            "",
+        ]
+
+        # Unexpected queries — only show when present.
+        unexpected = [(c.check_name, c.unexpected_query) for c in group.checks if c.unexpected_query]
+        if unexpected:
+            lines += ["<details><summary>Unexpected-row queries</summary>", ""]
+            for check_name, uq in unexpected:
+                lines += [
+                    f"**`{check_name}`**",
+                    "",
+                    "```sql",
+                    (uq or "").strip(),
+                    "```",
+                    "",
+                ]
+            lines += ["</details>", ""]
+
+        return lines
+
+    def _render_row_level_group(self, group: DQCheckGroup) -> list[str]:
+        """Render one row-level group as a markdown subsection with threshold info."""
+        lines: list[str] = [
+            f"### `{group.group_id}`",
+            "",
+            "| Check name | Metric key | Max invalid % |",
+            "|---|---|---|",
+        ]
+        for check in group.checks:
+            validator = self.validators.get(check.check_name)
+            max_pct = getattr(validator, "_max_invalid_pct", None)
+            threshold_str = f"{max_pct:.2%}" if max_pct is not None else "—"
+            lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {threshold_str} |")
+
+        lines += [
+            "",
+            "```sql",
+            group.query.strip(),
+            "```",
+            "",
+        ]
+        return lines
+
     def _load_or_generate_plan(self, planner: SQLDQPlanner, schema_ctx: str) -> DQPlan:
         """Return a cached plan when available, otherwise generate and cache a new one."""
-        if self._plan_hash is None:
-            if not isinstance(self.prompts, dict):
-                raise TypeError("prompts must be a dict[str, str] before generating a DQ plan.")
-            self._plan_hash = _compute_plan_hash(self.prompts, self.prompt_version, self.collect_unexpected)
+        if not isinstance(self.prompts, dict):
+            raise TypeError("prompts must be a dict[str, str] before generating a DQ plan.")
 
-        plan_hash = self._plan_hash
+        plan_hash = _compute_plan_hash(self.prompts, self.prompt_version, self.collect_unexpected)
         variable_key = f"{_PLAN_VARIABLE_PREFIX}{plan_hash}"
 
         cached_json = Variable.get(variable_key, default=None)
@@ -290,7 +454,24 @@ class LLMDataQualityOperator(LLMOperator):
         results_map: dict[str, Any],
         plan: DQPlan,
     ) -> list[DQCheckResult]:
-        """Apply validators to each metric value and return per-check results."""
+        """
+        Apply validators to each metric value and return per-check results.
+
+        For aggregate checks each validator callable receives the raw metric
+        value returned by the database.  For row-level checks, where *value* is
+        a :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`,
+        the pass/fail decision compares ``invalid_pct`` against the validator's
+        ``_max_invalid_pct`` attribute (defaulting to ``0.0`` when absent).
+        Checks without a registered validator are logged and marked as passed.
+
+        :param results_map: ``{check_name: metric_value_or_RowLevelResult}`` as
+            returned by
+            :meth:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner.execute_plan`.
+        :param plan: The DQ plan whose groups and checks drive iteration order.
+        :returns: Per-check
+            :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckResult`
+            list in plan-group order.
+        """
         check_results: list[DQCheckResult] = []
 
         for group in plan.groups:
@@ -301,7 +482,16 @@ class LLMDataQualityOperator(LLMOperator):
                 passed = True
                 failure_reason: str | None = None
 
-                if validator is not None:
+                if isinstance(value, RowLevelResult):
+                    # Row-level check: evaluate threshold against invalid_pct.
+                    max_pct = getattr(validator, "_max_invalid_pct", 0.0)
+                    passed = value.invalid_pct <= max_pct
+                    if not passed:
+                        failure_reason = (
+                            f"Row-level check failed: {value.invalid}/{value.total} rows invalid "
+                            f"({value.invalid_pct:.4%}), threshold {max_pct:.4%}"
+                        )
+                elif validator is not None:
                     try:
                         passed = bool(validator(value))
                     except Exception as exc:
@@ -310,6 +500,12 @@ class LLMDataQualityOperator(LLMOperator):
 
                     if not passed and failure_reason is None:
                         failure_reason = f"{repr(validator)} returned False"
+                else:
+                    self.log.warning(
+                        "No validator found for check %r (metric key: %r). Marking as passed by default.",
+                        check.check_name,
+                        check.metric_key,
+                    )
 
                 check_results.append(
                     DQCheckResult(
@@ -322,6 +518,10 @@ class LLMDataQualityOperator(LLMOperator):
                 )
 
         return check_results
+
+    def _collect_row_validators(self) -> dict[str, Callable[[Any], bool]]:
+        """Return the subset of validators that are row-level."""
+        return {name: fn for name, fn in self.validators.items() if default_registry.is_row_level(fn)}
 
     @staticmethod
     def _attach_unexpected(
@@ -352,11 +552,45 @@ class LLMDataQualityOperator(LLMOperator):
                 "Every validator key must correspond to a prompt key."
             )
 
-    def _resolve_db_hook(self) -> DbApiHook | None:
+    def _validate_prompts(self) -> None:
+        """
+        Raise :class:`ValueError` if *prompts* is an empty dict.
+
+        Skips validation when *prompts* is not yet a dict (decorator use-case).
+        """
+        if isinstance(self.prompts, dict) and not self.prompts:
+            raise ValueError("prompts must not be empty. Provide at least one check_name → description pair.")
+
+    @cached_property
+    def db_hook(self) -> DbApiHook | None:
         """Return a DbApiHook when *db_conn_id* is configured, or ``None``."""
         if not self.db_conn_id:
             return None
         return get_db_hook(self.db_conn_id)
+
+    def execute_complete(
+        self, context: Context, generated_output: str, event: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Resume after human approval and execute the data-quality checks.
+
+        Called automatically by Airflow when the HITL trigger fires.  The
+        ``generated_output`` is the JSON-serialised
+        :class:`~airflow.providers.common.ai.utils.dq_models.DQPlan` that was
+        deferred for review.
+
+        :param context: Airflow task context.
+        :param generated_output: JSON string of the approved
+            :class:`~airflow.providers.common.ai.utils.dq_models.DQPlan`.
+        :param event: Trigger event payload from the HITL reviewer.
+        :raises HITLRejectException: If the reviewer rejected the plan.
+        :raises HITLTimeoutError: If the approval timed out.
+        :raises AirflowException: If any data-quality check fails after approval.
+        """
+        approved_json = super().execute_complete(context, generated_output, event)
+        plan = DQPlan.model_validate_json(approved_json)
+        planner = self._build_planner()
+        return self._run_checks_and_report(context, planner, plan)
 
 
 def _compute_plan_hash(

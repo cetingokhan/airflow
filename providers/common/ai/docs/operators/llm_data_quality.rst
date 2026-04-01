@@ -30,7 +30,7 @@ target database, and validates each metric against the corresponding entry in
 on data quality.
 
 .. seealso::
-    :ref:`Connection configuration <howto/connection:pydantic_ai>`
+    :ref:`Connection configuration <howto/connection:pydanticai>`
 
 Basic Usage
 -----------
@@ -103,6 +103,19 @@ You can also use plain lambdas for one-off conditions::
 
 Checks without a validator are always marked as **passed** — metrics are still
 collected and included in the report, but no threshold is enforced.
+
+Custom Validators with ``register_validator``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the :func:`~airflow.providers.common.ai.utils.dq_validation.register_validator`
+decorator to attach an ``llm_context`` hint to your validator factory.  The
+operator injects the hint into the LLM system prompt so the model generates SQL
+that returns the metric format your validator expects:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
+    :language: python
+    :start-after: [START howto_operator_llm_dq_custom_validator]
+    :end-before: [END howto_operator_llm_dq_custom_validator]
 
 With Schema Introspection
 -------------------------
@@ -180,6 +193,92 @@ in the schema context.
     :start-after: [START howto_operator_llm_dq_s3_parquet]
     :end-before: [END howto_operator_llm_dq_s3_parquet]
 
+Row-Level Checks
+----------------
+
+Row-level validation lets you apply a Python predicate **per row** rather than
+against a single aggregate metric.  Instead of executing a ``COUNT`` or
+``AVG``, the LLM generates a plain ``SELECT`` statement and the operator
+fetches the result set, applies your validator to every value in turn, and
+aggregates the outcomes into a
+:class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`.
+
+To enable row-level mode for a validator, register it with ``row_level=True``
+via the :func:`~airflow.providers.common.ai.utils.dq_validation.register_validator`
+decorator::
+
+    @register_validator(
+        "my_format_check",
+        llm_context="ROW-LEVEL: SELECT id, col FROM table — no aggregation.",
+        check_category="row_level",
+        row_level=True,
+    )
+    def my_format_check(*, max_invalid_pct: float = 0.0):
+        def _check(value):
+            ...  # return True (valid) or False (invalid) for each row value
+        return _check
+
+The ``llm_context`` hint tells the LLM to generate a non-aggregating
+``SELECT`` covering every row.  The ``row_level=True`` flag marks the
+validator in the registry so the planner executes it in row-level mode.
+
+``RowLevelResult`` output
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For row-level checks, the ``value`` field in the output results dict is a
+serialised :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`
+dict with the following keys:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Key
+     - Type
+     - Description
+   * - ``total``
+     - ``int``
+     - Total number of rows evaluated.
+   * - ``invalid``
+     - ``int``
+     - Number of rows for which the validator returned ``False``.
+   * - ``invalid_pct``
+     - ``float``
+     - Fraction of invalid rows (``invalid / total``), or ``0.0`` when *total*
+       is zero.
+   * - ``sample_violations``
+     - ``list[str]``
+     - Up to ``sample_size`` string representations of failing values.
+   * - ``sample_size``
+     - ``int``
+     - The configured violation sample cap.
+
+The check **passes** when ``invalid_pct ≤ max_invalid_pct`` (the
+``_max_invalid_pct`` attribute on the validator callable, defaulting to
+``0.0``).
+
+``row_level_sample_size``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default the operator fetches every row for row-level checks (full table
+scan).  Set ``row_level_sample_size`` to a positive integer to add a ``LIMIT``
+to the generated ``SELECT``, bounding execution time and memory usage at the
+cost of sampling coverage:
+
+.. code-block:: python
+
+    LLMDataQualityOperator(
+        task_id="validate_email_format", row_level_sample_size=100_000, ...  # sample up to 100 k rows per check
+    )
+
+Example
+~~~~~~~
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
+    :language: python
+    :start-after: [START howto_operator_llm_dq_custom_row_level_validator]
+    :end-before: [END howto_operator_llm_dq_custom_row_level_validator]
+
 Plan Caching
 ------------
 
@@ -219,40 +318,69 @@ Dry Run Mode
 ------------
 
 Set ``dry_run=True`` to generate and cache the SQL plan without executing it.
-The operator returns the serialised plan dict, which you can inspect or route
-to a human-approval step with
-:class:`~airflow.providers.standard.operators.hitl.ApprovalOperator`:
+The operator returns the serialised plan dict, which you can inspect or log
+before running against production data:
 
-.. code-block:: python
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
+    :language: python
+    :start-after: [START howto_operator_llm_dq_dry_run_standalone]
+    :end-before: [END howto_operator_llm_dq_dry_run_standalone]
 
-    from airflow.providers.common.ai.operators.llm_data_quality import LLMDataQualityOperator
-    from airflow.providers.standard.operators.hitl import ApprovalOperator
+You can also combine ``dry_run=True`` with
+:class:`~airflow.providers.standard.operators.hitl.ApprovalOperator` to build
+an explicit three-step review pipeline where a human approves the generated
+SQL before it is executed:
 
-    preview = LLMDataQualityOperator(
-        task_id="preview_dq_plan",
-        llm_conn_id="pydanticai_default",
-        db_conn_id="postgres_default",
-        table_names=["sales"],
-        prompts={"row_count": "The sales table must have at least 1000 rows."},
-        dry_run=True,
-    )
-
-    approve = ApprovalOperator(task_id="approve_plan")
-
-    execute = LLMDataQualityOperator(
-        task_id="run_dq_checks",
-        llm_conn_id="pydanticai_default",
-        db_conn_id="postgres_default",
-        table_names=["sales"],
-        prompts={"row_count": "The sales table must have at least 1000 rows."},
-        validators={"row_count": row_count_check(min_count=1000)},
-    )
-
-    preview >> approve >> execute
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
+    :language: python
+    :start-after: [START howto_operator_llm_dq_with_human_approval]
+    :end-before: [END howto_operator_llm_dq_with_human_approval]
 
 Because the ``dry_run`` run already cached the plan under the same key, the
 execution run skips the LLM entirely and reads from the
 :class:`~airflow.models.variable.Variable` cache.
+
+Human-in-the-Loop Approval
+--------------------------
+
+Set ``require_approval=True`` to gate execution on human review.  When the
+plan has been generated and cached, the task defers and presents a formatted
+SQL-plan markdown to the reviewer.  Data-quality checks only run **after** the
+reviewer approves.  If the reviewer rejects, the task raises
+``HITLRejectException`` without executing any SQL.
+
+``dry_run`` and ``require_approval`` are independent:
+
+- ``dry_run=True`` — return the plan dict immediately, no approval prompt,
+  no SQL execution.
+- ``require_approval=True`` — generate the plan, defer for human review,
+  then execute checks after approval.
+- Both ``True`` — behaves as ``dry_run=True``; the approval prompt is
+  suppressed.
+
+.. code-block:: python
+
+    LLMDataQualityOperator(
+        task_id="validate_with_approval",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["orders"],
+        prompts={"row_count": "The orders table must have at least 1000 rows."},
+        validators={"row_count": row_count_check(min_count=1000)},
+        require_approval=True,
+        allow_modifications=False,
+    )
+
+A full runnable example:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
+    :language: python
+    :start-after: [START howto_operator_llm_dq_require_approval_builtin]
+    :end-before: [END howto_operator_llm_dq_require_approval_builtin]
+
+See :class:`~airflow.providers.common.ai.operators.llm.LLMOperator` for the
+full set of HITL parameters (``require_approval``, ``approval_timeout``,
+``allow_modifications``).
 
 TaskFlow Decorator
 ------------------
@@ -304,10 +432,12 @@ runtime information to build the prompts dict dynamically.
 Logging
 -------
 
-After executing each SQL group, the operator logs:
+The operator and its underlying planner log the following:
 
 - The schema context used (at INFO level).
 - Whether the plan was loaded from cache or freshly generated (at INFO level).
+- LLM run summary after plan generation: model name, token usage (input,
+  output, total), request count, and tool call sequence (at INFO level).
 - Per-group SQL queries and check names in ``dry_run`` mode (at INFO level).
 - The number of checks that passed after execution (at INFO level).
 - A failure summary raised as :class:`~airflow.exceptions.AirflowException`

@@ -41,7 +41,8 @@ except ImportError as e:
     raise AirflowOptionalProviderFeatureException(e)
 
 from airflow.providers.common.ai.utils.db_schema import build_schema_context, resolve_dialect
-from airflow.providers.common.ai.utils.dq_models import DQCheckGroup, DQPlan, UnexpectedResult
+from airflow.providers.common.ai.utils.dq_models import DQCheckGroup, DQPlan, RowLevelResult, UnexpectedResult
+from airflow.providers.common.ai.utils.logging import log_run_summary
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent
@@ -167,6 +168,21 @@ UNEXPECTED VALUE COLLECTION:
     unexpected_query: "SELECT id, phone FROM customers WHERE phone !~ '^\\d{{4}}-\\d{{4}}-\\d{{4}}$' LIMIT 100"
 """
 
+_ROW_LEVEL_PROMPT_SECTION = """
+
+ROW-LEVEL CHECKS:
+  Some checks are marked as row_level.  For these:
+    - Generate a SELECT that returns the primary key column(s) and the column
+      being validated.  Do NOT aggregate.
+    - Set row_level = true on the DQCheck entry.
+    - metric_key must be the name of the column containing the value to validate
+      (the Python validator will read row[metric_key] for each row).
+    - {row_level_limit_clause}
+    - Place ALL row-level checks for the same table in a single group.
+
+  Row-level check names that require this treatment: {row_level_check_names}
+"""
+
 
 class SQLDQPlanner:
     """
@@ -178,6 +194,17 @@ class SQLDQPlanner:
         Auto-detected from *db_hook* when ``None``.
     :param max_sql_retries: Maximum number of times a failing SQL group query is sent
         back to the LLM for correction before the error is re-raised.  Default ``2``.
+    :param validator_contexts: Pre-built LLM context string from
+        :meth:`~airflow.providers.common.ai.utils.dq_validation.ValidatorRegistry.build_llm_context`.
+        Appended to the system prompt so the LLM knows what metric format each
+        custom validator expects.
+    :param row_validators: Mapping of ``{check_name: row_level_callable}`` for
+        checks that require row-by-row Python validation.  When a check's name
+        appears here, ``execute_plan`` fetches all (or sampled) rows and applies
+        the callable to each value instead of reading a single aggregate scalar.
+    :param row_level_sample_size: Maximum number of rows to fetch for row-level
+        checks.  ``None`` (default) performs a full scan.  A positive integer
+        instructs the LLM to add ``LIMIT N`` to the generated SELECT.
     """
 
     def __init__(
@@ -192,6 +219,9 @@ class SQLDQPlanner:
         agent_params: dict[str, Any] | None = None,
         collect_unexpected: bool = False,
         unexpected_sample_size: int = 100,
+        validator_contexts: str = "",
+        row_validators: dict[str, Any] | None = None,
+        row_level_sample_size: int | None = None,
     ) -> None:
         self._llm_hook = llm_hook
         self._db_hook = db_hook
@@ -210,6 +240,9 @@ class SQLDQPlanner:
         self._agent_params: dict[str, Any] = agent_params or {}
         self._collect_unexpected = collect_unexpected
         self._unexpected_sample_size = unexpected_sample_size
+        self._validator_contexts = validator_contexts
+        self._row_validators: dict[str, Any] = row_validators or {}
+        self._row_level_sample_size = row_level_sample_size
         # Populated by generate_plan; used by _retry_fix_group to continue the conversation.
         self._plan_agent: Agent[None, DQPlan] | None = None
         self._plan_all_messages: list[ModelMessage] | None = None
@@ -262,6 +295,20 @@ class SQLDQPlanner:
         if schema_context:
             system_prompt += f"\nAvailable schema:\n{schema_context}\n"
 
+        if self._validator_contexts:
+            system_prompt += self._validator_contexts
+
+        if self._row_validators:
+            row_level_check_names = ", ".join(sorted(self._row_validators))
+            if self._row_level_sample_size is not None:
+                limit_clause = f"Add LIMIT {self._row_level_sample_size} to the query."
+            else:
+                limit_clause = "Do NOT add a LIMIT — return all rows."
+            system_prompt += _ROW_LEVEL_PROMPT_SECTION.format(
+                row_level_check_names=row_level_check_names,
+                row_level_limit_clause=limit_clause,
+            )
+
         if self._extra_system_prompt:
             system_prompt += f"\nAdditional instructions:\n{self._extra_system_prompt}\n"
 
@@ -274,6 +321,7 @@ class SQLDQPlanner:
             output_type=DQPlan, instructions=system_prompt, **self._agent_params
         )
         result = agent.run_sync(user_message)
+        log_run_summary(log, result)
 
         # Persist the agent and full conversation so execute_plan can continue
         # the same chat thread when asking for SQL corrections.
@@ -314,6 +362,13 @@ class SQLDQPlanner:
             group = self._validate_or_fix_group(raw_group)
             log.debug("Executing DQ group %r:\n%s", group.group_id, group.query)
 
+            # Row-level checks and aggregate checks are mutually exclusive within a group
+            # because the LLM places them in separate groups based on the system prompt.
+            if any(check.row_level for check in group.checks):
+                row_level_results = self._execute_row_level_group(group, datafusion_engine)
+                results.update(row_level_results)
+                continue
+
             if datafusion_engine is not None:
                 row = self._run_datafusion_group(datafusion_engine, group)
             else:
@@ -327,6 +382,106 @@ class SQLDQPlanner:
                         f"Available columns: {list(row.keys())}"
                     )
                 results[check.check_name] = row[check.metric_key]
+
+        return results
+
+    def _execute_row_level_group(
+        self,
+        group: DQCheckGroup,
+        datafusion_engine: DataFusionEngine | None,
+    ) -> dict[str, RowLevelResult]:
+        """
+        Apply row-level validators to every row returned by *group.query*.
+
+        For each :class:`~airflow.providers.common.ai.utils.dq_models.DQCheck`
+        in the group that has ``row_level=True``, the callable stored in
+        :attr:`_row_validators` is applied to ``row[check.metric_key]`` for
+        every fetched row.  A
+        :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`
+        is built from the aggregate counts and a sample of failing values.
+
+        :param group: A plan group whose checks all have ``row_level=True``.
+        :param datafusion_engine: Active DataFusion engine or ``None`` for DB.
+        :returns: ``{check_name: RowLevelResult}`` for every row-level check.
+        """
+        # Fetch all rows from the plain SELECT generated by the LLM.
+        if datafusion_engine is not None:
+            col_lists: dict[str, list[Any]] = datafusion_engine.execute_query(group.query)
+            if not col_lists:
+                log.warning("Row-level query for group %r returned no data.", group.group_id)
+                return {}
+            num_rows = max(len(v) for v in col_lists.values())
+            # Transpose column-oriented result to a list of row dicts.
+            rows: list[dict[str, Any]] = [
+                {col: vals[i] if i < len(vals) else None for col, vals in col_lists.items()}
+                for i in range(num_rows)
+            ]
+        else:
+            raw_rows = self._db_hook.get_records(group.query)  # type: ignore[union-attr]
+            if not raw_rows:
+                log.warning("Row-level query for group %r returned no rows.", group.group_id)
+                return {}
+            # Normalise to list[dict] regardless of whether hook returns dicts or sequences.
+            if isinstance(raw_rows[0], dict):
+                rows = list(raw_rows)  # type: ignore[arg-type]
+            else:
+                col_names = [check.metric_key for check in group.checks]
+                rows = [
+                    dict(zip(col_names, row))
+                    if isinstance(row, Sequence) and not isinstance(row, str | bytes | bytearray)
+                    else {}
+                    for row in raw_rows
+                ]
+
+        results: dict[str, RowLevelResult] = {}
+
+        for check in group.checks:
+            if not check.row_level:
+                continue
+            validator = self._row_validators.get(check.check_name)
+            if validator is None:
+                log.warning(
+                    "No row-level validator found for check %r — skipping.",
+                    check.check_name,
+                )
+                continue
+
+            # sample_size governs only the violation sample list, not which rows are fetched.
+            # The SQL LIMIT (set by the LLM) controls how many rows are actually fetched.
+            sample_size = self._row_level_sample_size or len(rows)
+            total = 0
+            invalid = 0
+            sample_violations: list[str] = []
+
+            for row in rows:
+                value = row.get(check.metric_key)
+                total += 1
+                try:
+                    passed = bool(validator(value))
+                except Exception:
+                    # Treat any exception from the validator as a validation failure.
+                    passed = False
+                if not passed:
+                    invalid += 1
+                    if len(sample_violations) < sample_size:
+                        sample_violations.append(str(value))
+
+            invalid_pct = invalid / total if total else 0.0
+            results[check.check_name] = RowLevelResult(
+                check_name=check.check_name,
+                total=total,
+                invalid=invalid,
+                invalid_pct=invalid_pct,
+                sample_violations=sample_violations,
+                sample_size=sample_size,
+            )
+            log.info(
+                "Row-level check %r: %d/%d invalid (%.4f%%)",
+                check.check_name,
+                invalid,
+                total,
+                invalid_pct * 100,
+            )
 
         return results
 

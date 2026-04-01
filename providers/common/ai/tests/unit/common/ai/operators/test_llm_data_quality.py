@@ -28,8 +28,13 @@ from airflow.providers.common.ai.operators.llm_data_quality import (
     LLMDataQualityOperator,
     _compute_plan_hash,
 )
-from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan
-from airflow.providers.common.ai.utils.dq_validation import null_pct_check, row_count_check
+from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan, RowLevelResult
+from airflow.providers.common.ai.utils.dq_validation import (
+    default_registry,
+    null_pct_check,
+    register_validator,
+    row_count_check,
+)
 from airflow.providers.common.compat.sdk import AirflowException
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,10 @@ class TestLLMDataQualityOperatorInit:
         assert hasattr(op, "template_fields")
         assert isinstance(op.template_fields, (list, tuple))
         assert set(op.template_fields) >= {"prompts", "system_prompt", "agent_params"}
+
+    def test_empty_prompts_raises_value_error(self):
+        with pytest.raises(ValueError, match="prompts must not be empty"):
+            _make_operator(prompts={})
 
 
 class TestComputePlanHash:
@@ -205,6 +214,8 @@ class TestLLMDataQualityOperatorExecute:
         )
         assert result["passed"] is True
         assert all(r["passed"] for r in result["results"])
+        assert "plan" in result
+        assert "groups" in result["plan"]
 
     def test_raises_airflow_exception_when_check_fails(self):
         plan = _make_plan()
@@ -293,12 +304,14 @@ class TestLLMDataQualityOperatorExecute:
             assert call_kwargs.kwargs["key"] == "return_value"
             pushed = call_kwargs.kwargs["value"]
             assert pushed["passed"] is False
+            assert "plan" in pushed
+            assert "groups" in pushed["plan"]
             assert any(r["check_name"] == "null_emails" and not r["passed"] for r in pushed["results"])
 
     @patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True)
     @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
     @patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True)
-    def test_dry_run_returns_markdown_without_executing(
+    def test_dry_run_returns_plan_dict_without_executing(
         self, mock_get_db_hook, mock_planner_cls, mock_variable
     ):
         plan = _make_plan()
@@ -311,11 +324,13 @@ class TestLLMDataQualityOperatorExecute:
         result = op.execute(context=_make_context())
 
         mock_planner.execute_plan.assert_not_called()
-        assert isinstance(result, str)
-        assert "# LLM Data Quality Dry Run" in result
-        assert "## Group 1: null_check" in result
-        assert "SELECT COUNT(*) AS null_email_count" in result
-        assert "- null_emails (null_email_count)" in result
+        assert isinstance(result, dict)
+        assert result["passed"] is None
+        assert result["results"] is None
+        assert "plan" in result
+        assert "groups" in result["plan"]
+        assert len(result["plan"]["groups"]) == 2
+        assert result["plan"]["groups"][0]["group_id"] == "null_check"
 
     @patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True)
     @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
@@ -331,6 +346,105 @@ class TestLLMDataQualityOperatorExecute:
         op.execute(context=_make_context())
 
         mock_variable.set.assert_called_once()
+
+
+class TestLLMDataQualityOperatorRequireApproval:
+    """Tests for require_approval behaviour — HITL gates execution before any SQL runs."""
+
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True)
+    def test_require_approval_defers_before_execution(
+        self, mock_get_db_hook, mock_planner_cls, mock_variable
+    ):
+        """When require_approval=True, defer_for_approval is called and execute_plan is not."""
+        plan = _make_plan()
+        mock_variable.get.return_value = None
+        mock_planner = mock_planner_cls.return_value
+        mock_planner.build_schema_context.return_value = ""
+        mock_planner.generate_plan.return_value = plan
+
+        op = _make_operator(require_approval=True)
+        with patch.object(op, "defer_for_approval") as mock_defer:
+            op.execute(context=_make_context())
+
+        mock_defer.assert_called_once()
+        # Second positional arg must be the JSON-serialised plan.
+        deferred_output = mock_defer.call_args.args[1]
+        DQPlan.model_validate_json(deferred_output)  # must be valid JSON
+        mock_planner.execute_plan.assert_not_called()
+
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True)
+    def test_dry_run_with_require_approval_returns_plan_dict_no_defer(
+        self, mock_get_db_hook, mock_planner_cls, mock_variable
+    ):
+        """dry_run=True must short-circuit before require_approval is evaluated."""
+        plan = _make_plan()
+        mock_variable.get.return_value = None
+        mock_planner = mock_planner_cls.return_value
+        mock_planner.build_schema_context.return_value = ""
+        mock_planner.generate_plan.return_value = plan
+
+        op = _make_operator(dry_run=True, require_approval=True)
+        with patch.object(op, "defer_for_approval") as mock_defer:
+            result = op.execute(context=_make_context())
+
+        mock_defer.assert_not_called()
+        mock_planner.execute_plan.assert_not_called()
+        assert isinstance(result, dict)
+        assert result["passed"] is None
+        assert result["results"] is None
+        assert "plan" in result
+        assert "groups" in result["plan"]
+
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True)
+    def test_execute_complete_runs_checks_after_approval(self, mock_get_db_hook, mock_planner_cls):
+        """execute_complete deserializes the plan and executes checks on approval."""
+        plan = _make_plan()
+        mock_planner = mock_planner_cls.return_value
+        mock_planner.execute_plan.return_value = {"null_emails": 0, "dup_ids": 0}
+
+        op = _make_operator(require_approval=True)
+        approval_event = {
+            "chosen_options": ["Approve"],
+            "params_input": {},
+            "responded_by_user": "alice",
+        }
+        result = op.execute_complete(
+            context=_make_context(),
+            generated_output=plan.model_dump_json(),
+            event=approval_event,
+        )
+
+        mock_planner.execute_plan.assert_called_once()
+        assert result["passed"] is True
+        assert "plan" in result
+        assert "groups" in result["plan"]
+
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True)
+    @patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True)
+    def test_execute_complete_raises_on_rejection(self, mock_get_db_hook, mock_planner_cls):
+        """execute_complete raises HITLRejectException when the reviewer rejects."""
+        from airflow.providers.standard.exceptions import HITLRejectException
+
+        plan = _make_plan()
+        op = _make_operator(require_approval=True)
+        rejection_event = {
+            "chosen_options": ["Reject"],
+            "params_input": {},
+            "responded_by_user": "alice",
+        }
+        with pytest.raises(HITLRejectException):
+            op.execute_complete(
+                context=_make_context(),
+                generated_output=plan.model_dump_json(),
+                event=rejection_event,
+            )
+
+        mock_planner_cls.return_value.execute_plan.assert_not_called()
 
 
 class TestLLMDataQualityOperatorSystemPromptAndAgentParams:
@@ -395,7 +509,7 @@ class TestLLMDataQualityOperatorDbHook:
 
     def test_none_db_conn_id_returns_none_hook(self):
         op = _make_operator(db_conn_id=None)
-        assert op._resolve_db_hook() is None
+        assert op.db_hook is None
 
 
 class TestLLMDataQualityOperatorCollectUnexpected:
@@ -517,3 +631,197 @@ class TestComputePlanHashCollectUnexpected:
         h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
         h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
         assert h1 == h2
+
+
+# ---------------------------------------------------------------------------
+# Row-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_row_level_plan() -> DQPlan:
+    """Return a minimal plan whose single check has ``row_level=True``."""
+    return DQPlan(
+        groups=[
+            DQCheckGroup(
+                group_id="email_row_level",
+                query="SELECT id, email FROM customers",
+                checks=[
+                    DQCheck(
+                        check_name="email_format",
+                        metric_key="email",
+                        group_id="email_row_level",
+                        row_level=True,
+                    )
+                ],
+            )
+        ]
+    )
+
+
+def _make_row_level_validator(max_invalid_pct: float):
+    """Return a plain callable stamped with row-level introspection attributes."""
+
+    def _check(v: Any) -> bool:
+        return bool(v)
+
+    _check._max_invalid_pct = max_invalid_pct  # type: ignore[attr-defined]
+    _check._row_level = True  # type: ignore[attr-defined]
+    _check._validator_name = "_inline_row_level"  # type: ignore[attr-defined]
+    return _check
+
+
+class TestLLMDataQualityOperatorRowLevel:
+    """Tests for row-level check evaluation, serialisation, and planner forwarding."""
+
+    def _run_row_level(self, row_result: Any, max_invalid_pct: float) -> dict[str, Any]:
+        plan = _make_row_level_plan()
+        with (
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
+            ) as mock_var,
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True
+            ) as mock_planner_cls,
+            patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True),
+        ):
+            mock_var.get.return_value = None
+            mock_planner = mock_planner_cls.return_value
+            mock_planner.build_schema_context.return_value = ""
+            mock_planner.generate_plan.return_value = plan
+            mock_planner.execute_plan.return_value = {"email_format": row_result}
+
+            op = _make_operator(
+                prompts={"email_format": "Validate email column row by row"},
+                validators={"email_format": _make_row_level_validator(max_invalid_pct)},
+            )
+            return op.execute(context=_make_context())
+
+    def test_row_level_passes_when_under_threshold(self):
+
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=100,
+            invalid=3,
+            invalid_pct=0.03,
+            sample_violations=[],
+            sample_size=10,
+        )
+        result = self._run_row_level(row_result, max_invalid_pct=0.05)
+        assert result["passed"] is True
+
+    def test_row_level_fails_when_over_threshold(self):
+
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=100,
+            invalid=10,
+            invalid_pct=0.10,
+            sample_violations=["bad@", "noemail"],
+            sample_size=10,
+        )
+        with pytest.raises(AirflowException):
+            self._run_row_level(row_result, max_invalid_pct=0.05)
+
+    def test_row_level_failure_message_contains_counts_and_threshold(self):
+
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=200,
+            invalid=30,
+            invalid_pct=0.15,
+            sample_violations=[],
+            sample_size=10,
+        )
+        with pytest.raises(AirflowException) as exc_info:
+            self._run_row_level(row_result, max_invalid_pct=0.05)
+        msg = str(exc_info.value)
+        assert "30" in msg
+        assert "200" in msg
+        assert "0.05" in msg or "5.0000%" in msg
+
+    def test_row_level_boundary_at_threshold_passes(self):
+
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=100,
+            invalid=5,
+            invalid_pct=0.05,
+            sample_violations=[],
+            sample_size=5,
+        )
+        result = self._run_row_level(row_result, max_invalid_pct=0.05)
+        assert result["passed"] is True
+
+    def test_collect_row_validators_returns_only_row_level(self):
+        name = "_test_rl_collect_op"
+        try:
+
+            @register_validator(name, llm_context="ROW-LEVEL check.", row_level=True)
+            def _rl_factory():
+                return lambda v: bool(v)
+
+            op = _make_operator(
+                prompts={"email_format": "Validate email", "null_emails": "Check nulls"},
+                validators={
+                    "email_format": _rl_factory(),
+                    "null_emails": null_pct_check(max_pct=0.0),
+                },
+            )
+            row_validators = op._collect_row_validators()
+            assert "email_format" in row_validators
+            assert "null_emails" not in row_validators
+        finally:
+            default_registry.unregister(name)
+
+    def test_row_level_sample_size_forwarded_to_planner(self):
+        plan = _make_plan()
+        with (
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
+            ) as mock_var,
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True
+            ) as mock_planner_cls,
+            patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True),
+        ):
+            mock_var.get.return_value = None
+            mock_planner = mock_planner_cls.return_value
+            mock_planner.build_schema_context.return_value = ""
+            mock_planner.generate_plan.return_value = plan
+            mock_planner.execute_plan.return_value = {k: 0 for k in plan.check_names}
+
+            op = _make_operator(row_level_sample_size=5000)
+            op.execute(context=_make_context())
+
+            planner_kwargs = mock_planner_cls.call_args.kwargs
+            assert planner_kwargs["row_level_sample_size"] == 5000
+
+    def test_row_level_result_serialized_as_dict_in_output(self):
+
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=50,
+            invalid=1,
+            invalid_pct=0.02,
+            sample_violations=["bad"],
+            sample_size=10,
+        )
+        result = self._run_row_level(row_result, max_invalid_pct=0.05)
+        assert result["passed"] is True
+        check_result = result["results"][0]
+        value = check_result["value"]
+        assert isinstance(value, dict)
+        assert value["total"] == 50
+        assert value["invalid"] == 1
+        assert value["invalid_pct"] == 0.02
+        assert value["sample_violations"] == ["bad"]
+
+    def test_dry_run_markdown_contains_row_level_section(self):
+        plan = _make_row_level_plan()
+        op = _make_operator(
+            prompts={"email_format": "Validate email column row by row"},
+            validators={"email_format": _make_row_level_validator(0.0)},
+        )
+        md = op._build_dry_run_markdown(plan)
+        assert "Row-Level Checks" in md
+        assert "email_row_level" in md

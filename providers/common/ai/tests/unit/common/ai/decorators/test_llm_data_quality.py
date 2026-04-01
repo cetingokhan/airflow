@@ -229,8 +229,12 @@ class TestLLMDQDecoratedOperator:
             op.execute(context={"task_instance": MagicMock()})
             assert "1000" in op.prompts["row_count"]
 
-    def test_dry_run_returns_markdown_preview(self):
-        """dry_run=True returns a markdown preview without executing checks."""
+    def test_dry_run_returns_plan_dict(self):
+        """dry_run=True returns a unified dict with plan, passed=None, results=None."""
         plan = _make_plan()
         result = _run_op(lambda: _PROMPTS, plan, {}, dry_run=True)
-        assert "# LLM Data Quality Dry Run" in result
+        assert isinstance(result, dict)
+        assert result["passed"] is None
+        assert result["results"] is None
+        assert "plan" in result
+        assert "groups" in result["plan"]

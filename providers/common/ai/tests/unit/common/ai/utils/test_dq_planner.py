@@ -41,9 +41,12 @@ def _make_plan(*check_names: str) -> DQPlan:
 
 def _make_llm_hook(plan: DQPlan) -> MagicMock:
     """Helper: mock PydanticAIHook that returns *plan* from agent.run_sync."""
-    mock_result = MagicMock(spec=["output", "all_messages"])
+    mock_usage = MagicMock(requests=1, tool_calls=0, input_tokens=100, output_tokens=50, total_tokens=150)
+    mock_result = MagicMock(spec=["output", "all_messages", "usage", "response"])
     mock_result.output = plan
     mock_result.all_messages.return_value = []
+    mock_result.usage.return_value = mock_usage
+    mock_result.response.model_name = "test-model"
     mock_agent = MagicMock(spec=["run_sync"])
     mock_agent.run_sync.return_value = mock_result
     mock_hook = MagicMock(spec=PydanticAIHook)
