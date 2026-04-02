@@ -144,6 +144,17 @@ class TestComputePlanHash:
         h = _compute_plan_hash(_PROMPTS, "a" * 300)
         assert len(h) <= _PLAN_VARIABLE_KEY_MAX_LEN
 
+    def test_long_version_tag_preserves_digest_uniqueness(self):
+        # Before the fix, a 300-char version_tag caused the full key to be sliced
+        # to _PLAN_VARIABLE_KEY_MAX_LEN, truncating the 16-char digest away entirely.
+        # Two different prompt payloads with the same long tag would then produce
+        # identical cache keys, causing a stale plan to be served.
+        long_tag = "x" * 300
+        other = {"a": "completely different description"}
+        h1 = _compute_plan_hash(_PROMPTS, long_tag)
+        h2 = _compute_plan_hash(other, long_tag)
+        assert h1 != h2, "Different prompts must produce different hashes even with a long version_tag"
+
 
 class TestLLMDataQualityOperatorCache:
     @patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True)
@@ -519,6 +530,7 @@ class TestLLMDataQualityOperatorCollectUnexpected:
         op = _make_operator()
         assert "collect_unexpected" in op.template_fields
         assert "unexpected_sample_size" in op.template_fields
+        assert "row_level_sample_size" in op.template_fields
 
     def test_collect_unexpected_defaults_false(self):
         op = _make_operator()

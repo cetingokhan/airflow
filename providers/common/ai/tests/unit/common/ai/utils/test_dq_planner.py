@@ -590,14 +590,15 @@ class TestSQLDQPlannerSQLRetry:
         assert mock_agent.run_sync.call_count == 2
 
     def test_max_sql_retries_zero_raises_immediately(self):
-        """With max_sql_retries=0 the original error is re-raised after the first failure."""
+        """With max_sql_retries=0 the original error is re-raised without wrapping."""
         bad_plan = _single_group_plan("DROP TABLE t")
         mock_db_hook = MagicMock()
 
         planner = self._planner_with_agent(MagicMock(), db_hook=mock_db_hook, max_sql_retries=0)
-        with pytest.raises(SQLSafetyError):
+        with pytest.raises(SQLSafetyError, match="not allowed") as exc_info:
             planner.execute_plan(bad_plan)
 
+        assert "attempt" not in str(exc_info.value).lower()
         planner._plan_agent.run_sync.assert_not_called()
 
     def test_no_plan_agent_re_raises_original_error(self):
@@ -891,3 +892,114 @@ class TestSQLDQPlannerCollectUnexpected:
         assert "string_format" in instructions
         assert "MAX 5 CHECKS PER GROUP" in instructions
         assert "check_category" in instructions
+
+
+def _make_row_level_plan(check_name: str = "age_valid") -> DQPlan:
+    """Helper: minimal DQPlan with one row-level group."""
+    return DQPlan(
+        groups=[
+            DQCheckGroup(
+                group_id="row_group",
+                query="SELECT age FROM customers",
+                checks=[
+                    DQCheck(
+                        check_name=check_name,
+                        metric_key="age",
+                        group_id="row_group",
+                        row_level=True,
+                    )
+                ],
+            )
+        ]
+    )
+
+
+class TestSQLDQPlannerRowLevel:
+    """Tests for the row-level execution path in _execute_row_level_group."""
+
+    @patch("airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._build_datafusion_engine")
+    def test_datafusion_empty_query_returns_zero_total(self, mock_build_engine):
+        """DataFusion execute_query returning {} must yield RowLevelResult(total=0) per check."""
+        mock_engine = MagicMock()
+        mock_engine.execute_query.return_value = {}
+        mock_build_engine.return_value = mock_engine
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=None,
+            datasource_config=MagicMock(),
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=mock_engine,
+        )
+
+        assert "age_valid" in result, "KeyError: check absent from result"
+        r = result["age_valid"]
+        assert r.total == 0
+        assert r.invalid == 0
+        assert r.invalid_pct == 0.0
+        assert r.sample_violations == []
+        assert r.sample_size == 0
+
+    def test_db_empty_query_returns_zero_total(self):
+        """DB get_records returning [] must yield RowLevelResult(total=0) per check."""
+        mock_db_hook = MagicMock()
+        mock_db_hook.get_records.return_value = []
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        assert "age_valid" in result, "KeyError: check absent from result"
+        r = result["age_valid"]
+        assert r.total == 0
+        assert r.invalid == 0
+        assert r.invalid_pct == 0.0
+        assert r.sample_violations == []
+        assert r.sample_size == 0
+
+    def test_db_tuple_rows_use_cursor_description_for_column_names(self):
+        """Tuple rows must be mapped via last_description, not metric_key position.
+
+        The LLM-generated SELECT includes a leading PK column:
+            SELECT id, age FROM customers
+        get_records() returns tuples such as (1, 25).  Without cursor description
+        the fallback zip([metric_key], tuple) would map position-0 (id=1) to 'age',
+        silently validating the wrong value.  With description the mapping is correct.
+        """
+        mock_db_hook = MagicMock()
+        # Rows: (id, age) — second row has NULL age; first and third are valid.
+        mock_db_hook.get_records.return_value = [(1, 25), (2, None), (3, 30)]
+        # Simulate DbApiHook.last_description populated after get_records().
+        mock_db_hook.last_description = [
+            ("id", None, None, None, None, None, None),
+            ("age", None, None, None, None, None, None),
+        ]
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        assert "age_valid" in result
+        r = result["age_valid"]
+        # Row (2, None): age is None → 1 invalid; (1,25) and (3,30) pass.
+        assert r.total == 3
+        assert r.invalid == 1
+        assert r.sample_violations == ["None"]

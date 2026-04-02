@@ -411,7 +411,18 @@ class SQLDQPlanner:
             col_lists: dict[str, list[Any]] = datafusion_engine.execute_query(group.query)
             if not col_lists:
                 log.warning("Row-level query for group %r returned no data.", group.group_id)
-                return {}
+                return {
+                    check.check_name: RowLevelResult(
+                        check_name=check.check_name,
+                        total=0,
+                        invalid=0,
+                        invalid_pct=0.0,
+                        sample_violations=[],
+                        sample_size=0,
+                    )
+                    for check in group.checks
+                    if check.row_level
+                }
             num_rows = max(len(v) for v in col_lists.values())
             # Transpose column-oriented result to a list of row dicts.
             rows: list[dict[str, Any]] = [
@@ -422,12 +433,27 @@ class SQLDQPlanner:
             raw_rows = self._db_hook.get_records(group.query)  # type: ignore[union-attr]
             if not raw_rows:
                 log.warning("Row-level query for group %r returned no rows.", group.group_id)
-                return {}
+                return {
+                    check.check_name: RowLevelResult(
+                        check_name=check.check_name,
+                        total=0,
+                        invalid=0,
+                        invalid_pct=0.0,
+                        sample_violations=[],
+                        sample_size=0,
+                    )
+                    for check in group.checks
+                    if check.row_level
+                }
             # Normalise to list[dict] regardless of whether hook returns dicts or sequences.
             if isinstance(raw_rows[0], dict):
                 rows = list(raw_rows)  # type: ignore[arg-type]
             else:
-                col_names = [check.metric_key for check in group.checks]
+                description = getattr(self._db_hook, "last_description", None)
+                if description:
+                    col_names = [str(col[0]) for col in description]
+                else:
+                    col_names = [check.metric_key for check in group.checks]
                 rows = [
                     dict(zip(col_names, row))
                     if isinstance(row, Sequence) and not isinstance(row, str | bytes | bytearray)
@@ -575,6 +601,9 @@ class SQLDQPlanner:
         the model has full context without needing to re-read the original prompt.
         """
         if self._plan_agent is None or self._plan_all_messages is None:
+            raise initial_error
+
+        if self._max_sql_retries <= 0:
             raise initial_error
 
         dialect_label = self._dialect or ("DataFusion-compatible SQL" if self._is_datafusion else "SQL")

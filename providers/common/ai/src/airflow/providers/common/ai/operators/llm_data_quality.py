@@ -135,6 +135,7 @@ class LLMDataQualityOperator(LLMOperator):
         "prompt_version",
         "collect_unexpected",
         "unexpected_sample_size",
+        "row_level_sample_size",
     )
 
     def __init__(
@@ -611,5 +612,5 @@ def _compute_plan_hash(
         payload += ":unexpected=1"
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
     version_tag = prompt_version or "default"
-    key = f"{version_tag}_{digest}"
-    return key[:_PLAN_VARIABLE_KEY_MAX_LEN]
+    max_tag_len = _PLAN_VARIABLE_KEY_MAX_LEN - len(digest) - 1  # -1 for the "_" separator
+    return f"{version_tag[:max_tag_len]}_{digest}"
