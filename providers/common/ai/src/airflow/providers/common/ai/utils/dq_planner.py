@@ -75,7 +75,9 @@ GROUPING STRATEGY (multi-dimensional):
     - numeric_range   — range, bounds, or statistical checks on numeric columns
     - row_count       — total row counts or existence checks
     - string_format   — length, encoding, whitespace, or character-set checks
+    - row_level       — per-row or anomaly checks that evaluate individual records
 
+  Row-level checks still follow the same grouping rule: group by (target_table, check_category="row_level").
   MAX {max_checks_per_group} CHECKS PER GROUP:
     If a (table, category) pair has more than {max_checks_per_group} checks,
     split them into sub-groups of at most {max_checks_per_group}.
