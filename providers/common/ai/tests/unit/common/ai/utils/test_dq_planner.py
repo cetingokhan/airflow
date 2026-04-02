@@ -917,12 +917,36 @@ def _make_row_level_plan(check_name: str = "age_valid") -> DQPlan:
 class TestSQLDQPlannerRowLevel:
     """Tests for the row-level execution path in _execute_row_level_group."""
 
-    @patch("airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._build_datafusion_engine")
-    def test_datafusion_empty_query_returns_zero_total(self, mock_build_engine):
-        """DataFusion execute_query returning {} must yield RowLevelResult(total=0) per check."""
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_cursor(rows: list, col_names: list[str]) -> MagicMock:
+        """Return a mock cursor that yields *rows* on the first fetchmany() call."""
+        cursor = MagicMock()
+        cursor.description = [(name, None, None, None, None, None, None) for name in col_names]
+        # First fetchmany returns the rows; second signals end-of-result.
+        cursor.fetchmany.side_effect = [rows, []]
+        return cursor
+
+    @staticmethod
+    def _make_db_hook(cursor: MagicMock) -> MagicMock:
+        """Wrap *cursor* in a mock DbApiHook whose get_conn() returns a mock connection."""
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = cursor
+        mock_hook = MagicMock()
+        mock_hook.get_conn.return_value = mock_conn
+        return mock_hook
+
+    # ------------------------------------------------------------------
+    # DataFusion path
+    # ------------------------------------------------------------------
+
+    def test_datafusion_empty_query_returns_zero_total(self):
+        """DataFusion iter_query_row_chunks yielding no batches must produce total=0."""
         mock_engine = MagicMock()
-        mock_engine.execute_query.return_value = {}
-        mock_build_engine.return_value = mock_engine
+        mock_engine.iter_query_row_chunks.return_value = iter([])
 
         planner = SQLDQPlanner(
             llm_hook=MagicMock(spec=PydanticAIHook),
@@ -936,7 +960,7 @@ class TestSQLDQPlannerRowLevel:
             datafusion_engine=mock_engine,
         )
 
-        assert "age_valid" in result, "KeyError: check absent from result"
+        assert "age_valid" in result
         r = result["age_valid"]
         assert r.total == 0
         assert r.invalid == 0
@@ -944,10 +968,44 @@ class TestSQLDQPlannerRowLevel:
         assert r.sample_violations == []
         assert r.sample_size == 0
 
+    def test_datafusion_rows_processed_per_batch(self):
+        """DataFusion path processes rows from multiple RecordBatch dicts correctly."""
+        mock_engine = MagicMock()
+        # Two batches: batch-1 has 2 rows, batch-2 has 1 row with None age.
+        mock_engine.iter_query_row_chunks.return_value = iter(
+            [
+                {"age": [25, 30]},
+                {"age": [None]},
+            ]
+        )
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=None,
+            datasource_config=MagicMock(),
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=mock_engine,
+        )
+
+        assert "age_valid" in result
+        r = result["age_valid"]
+        assert r.total == 3
+        assert r.invalid == 1
+        assert r.invalid_pct == pytest.approx(1 / 3)
+        assert r.sample_violations == ["None"]
+
+    # ------------------------------------------------------------------
+    # DB path — basic cases
+    # ------------------------------------------------------------------
+
     def test_db_empty_query_returns_zero_total(self):
-        """DB get_records returning [] must yield RowLevelResult(total=0) per check."""
-        mock_db_hook = MagicMock()
-        mock_db_hook.get_records.return_value = []
+        """Cursor returning no rows must yield RowLevelResult(total=0) per check."""
+        cursor = self._make_cursor(rows=[], col_names=["age"])
+        mock_db_hook = self._make_db_hook(cursor)
 
         planner = SQLDQPlanner(
             llm_hook=MagicMock(spec=PydanticAIHook),
@@ -960,7 +1018,7 @@ class TestSQLDQPlannerRowLevel:
             datafusion_engine=None,
         )
 
-        assert "age_valid" in result, "KeyError: check absent from result"
+        assert "age_valid" in result
         r = result["age_valid"]
         assert r.total == 0
         assert r.invalid == 0
@@ -969,22 +1027,16 @@ class TestSQLDQPlannerRowLevel:
         assert r.sample_size == 0
 
     def test_db_tuple_rows_use_cursor_description_for_column_names(self):
-        """Tuple rows must be mapped via last_description, not metric_key position.
+        """Tuple rows must be mapped via cursor.description, not metric_key position.
 
         The LLM-generated SELECT includes a leading PK column:
             SELECT id, age FROM customers
-        get_records() returns tuples such as (1, 25).  Without cursor description
-        the fallback zip([metric_key], tuple) would map position-0 (id=1) to 'age',
+        Without cursor.description the fallback would map position-0 (id=1) to 'age',
         silently validating the wrong value.  With description the mapping is correct.
         """
-        mock_db_hook = MagicMock()
-        # Rows: (id, age) — second row has NULL age; first and third are valid.
-        mock_db_hook.get_records.return_value = [(1, 25), (2, None), (3, 30)]
-        # Simulate DbApiHook.last_description populated after get_records().
-        mock_db_hook.last_description = [
-            ("id", None, None, None, None, None, None),
-            ("age", None, None, None, None, None, None),
-        ]
+        rows = [(1, 25), (2, None), (3, 30)]
+        cursor = self._make_cursor(rows=rows, col_names=["id", "age"])
+        mock_db_hook = self._make_db_hook(cursor)
 
         planner = SQLDQPlanner(
             llm_hook=MagicMock(spec=PydanticAIHook),
@@ -1003,3 +1055,120 @@ class TestSQLDQPlannerRowLevel:
         assert r.total == 3
         assert r.invalid == 1
         assert r.sample_violations == ["None"]
+
+    # ------------------------------------------------------------------
+    # DB path — chunked processing
+    # ------------------------------------------------------------------
+
+    def test_db_rows_spread_across_multiple_chunks(self):
+        """All rows across multiple fetchmany() calls are counted correctly."""
+        cursor = MagicMock()
+        cursor.description = [("age", None, None, None, None, None, None)]
+        # Simulate three chunks: 2 valid, 1 invalid (None), empty sentinel.
+        cursor.fetchmany.side_effect = [
+            [(25,), (30,)],
+            [(None,)],
+            [],
+        ]
+        mock_db_hook = self._make_db_hook(cursor)
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        r = result["age_valid"]
+        assert r.total == 3
+        assert r.invalid == 1
+        assert r.sample_violations == ["None"]
+
+    def test_db_violation_sample_capped_at_max(self):
+        """sample_violations must never exceed _MAX_VIOLATION_SAMPLES regardless of row count."""
+        from airflow.providers.common.ai.utils.dq_planner import _MAX_VIOLATION_SAMPLES
+
+        # Generate more invalid values than the cap.
+        num_invalid = _MAX_VIOLATION_SAMPLES + 50
+        rows = [(None,)] * num_invalid
+
+        cursor = MagicMock()
+        cursor.description = [("age", None, None, None, None, None, None)]
+        cursor.fetchmany.side_effect = [rows, []]
+        mock_db_hook = self._make_db_hook(cursor)
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        r = result["age_valid"]
+        assert r.total == num_invalid
+        assert r.invalid == num_invalid
+        # Violation list is capped — must not grow unboundedly.
+        assert len(r.sample_violations) == _MAX_VIOLATION_SAMPLES
+        assert r.sample_size == _MAX_VIOLATION_SAMPLES
+
+    def test_db_dict_rows_processed_correctly(self):
+        """Dict rows (some DB drivers return dicts) are handled without column-name lookup."""
+        rows = [{"id": 1, "age": 25}, {"id": 2, "age": None}, {"id": 3, "age": 30}]
+        cursor = MagicMock()
+        cursor.description = [
+            ("id", None, None, None, None, None, None),
+            ("age", None, None, None, None, None, None),
+        ]
+        cursor.fetchmany.side_effect = [rows, []]
+        mock_db_hook = self._make_db_hook(cursor)
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        r = result["age_valid"]
+        assert r.total == 3
+        assert r.invalid == 1
+        assert r.sample_violations == ["None"]
+
+    def test_validator_exception_counted_as_invalid(self):
+        """A validator that raises must count the row as invalid, not propagate the exception."""
+        rows = [(25,), ("bad_value",), (30,)]
+        cursor = self._make_cursor(rows=rows, col_names=["age"])
+        mock_db_hook = self._make_db_hook(cursor)
+
+        def strict_validator(v):
+            if not isinstance(v, int):
+                raise TypeError("expected int")
+            return v > 0
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": strict_validator},
+        )
+
+        result = planner._execute_row_level_group(
+            _make_row_level_plan().groups[0],
+            datafusion_engine=None,
+        )
+
+        r = result["age_valid"]
+        assert r.total == 3
+        assert r.invalid == 1  # only "bad_value" raises; 25 and 30 pass
+        assert r.sample_violations == ["bad_value"]

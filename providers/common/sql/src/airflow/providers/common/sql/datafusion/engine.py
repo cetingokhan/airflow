@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from datafusion import SessionContext
@@ -118,6 +119,20 @@ class DataFusionEngine(LoggingMixin):
                     return {column: values[:max_rows] for column, values in result.items()}
                 return result
             return df.to_pydict()
+        except Exception as e:
+            raise QueryExecutionException(f"Error while executing query: {e}")
+
+    def iter_query_row_chunks(self, query: str) -> Iterator[dict[str, list[Any]]]:
+        """
+        Execute *query* and yield one column-dict per RecordBatch, streaming results.
+
+        :param query: SQL SELECT query to execute.
+        :raises QueryExecutionException: On SQL execution errors.
+        """
+        try:
+            df = self.session_context.sql(query)
+            for batch in df:
+                yield batch.to_pyarrow().to_pydict()
         except Exception as e:
             raise QueryExecutionException(f"Error while executing query: {e}")
 
