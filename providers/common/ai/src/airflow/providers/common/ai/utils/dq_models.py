@@ -28,6 +28,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
 
+from airflow.providers.common.compat.sdk import AirflowException
+
 
 class DQCheck(BaseModel):
     """
@@ -42,7 +44,7 @@ class DQCheck(BaseModel):
         description.  Used to sub-group checks within a table so that checks of
         different natures (e.g. null-checks vs. regex validity) land in separate
         SQL queries.  Allowed values: ``null_check``, ``uniqueness``, ``validity``,
-        ``numeric_range``, ``row_count``, ``string_format``.
+        ``numeric_range``, ``row_count``, ``string_format``, ``row_level``.
     :param unexpected_query: Optional SELECT query that returns the top N rows
         violating the check condition.  Populated by the LLM only for
         validity / regex / format checks when ``collect_unexpected`` is enabled.
@@ -225,3 +227,7 @@ class DQReport:
                 line += f" [{len(r.unexpected.unexpected_records)} unexpected row(s) sampled]"
             lines.append(line)
         return cls(results=results, passed=False, failure_summary="\n".join(lines))
+
+
+class DQCheckFailedError(AirflowException):
+    """Raised when one or more data-quality checks fail threshold validation."""

@@ -24,6 +24,7 @@ from airflow.providers.common.ai.hooks.pydantic_ai import PydanticAIHook
 from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan
 from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner
 from airflow.providers.common.ai.utils.sql_validation import SQLSafetyError
+from airflow.providers.common.sql.hooks.sql import DbApiHook
 
 
 def _make_plan(*check_names: str) -> DQPlan:
@@ -935,7 +936,7 @@ class TestSQLDQPlannerRowLevel:
         """Wrap *cursor* in a mock DbApiHook whose get_conn() returns a mock connection."""
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = cursor
-        mock_hook = MagicMock()
+        mock_hook = MagicMock(spec=DbApiHook)
         mock_hook.get_conn.return_value = mock_conn
         return mock_hook
 
@@ -1172,3 +1173,133 @@ class TestSQLDQPlannerRowLevel:
         assert r.total == 3
         assert r.invalid == 1  # only "bad_value" raises; 25 and 30 pass
         assert r.sample_violations == ["bad_value"]
+
+
+class TestSQLDQPlannerGroupHomogeneity:
+    """execute_plan must reject groups that mix row-level and aggregate checks."""
+
+    def _planner_with_db_hook(self, mock_db_hook) -> SQLDQPlanner:
+        return SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+            row_validators={"age_valid": lambda v: v is not None},
+        )
+
+    def test_mixed_group_raises_value_error(self):
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="mixed_group",
+                    query="SELECT COUNT(*) AS total, age FROM customers",
+                    checks=[
+                        DQCheck(
+                            check_name="row_count",
+                            metric_key="total",
+                            group_id="mixed_group",
+                            row_level=False,
+                        ),
+                        DQCheck(
+                            check_name="age_valid",
+                            metric_key="age",
+                            group_id="mixed_group",
+                            row_level=True,
+                        ),
+                    ],
+                )
+            ]
+        )
+        planner = self._planner_with_db_hook(mock_db_hook)
+        with pytest.raises(ValueError, match="mixed_group"):
+            planner.execute_plan(plan)
+
+    def test_pure_row_level_group_not_rejected(self):
+        cursor = MagicMock()
+        cursor.description = [("age", None, None, None, None, None, None)]
+        cursor.fetchmany.side_effect = [[], []]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = cursor
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_conn.return_value = mock_conn
+
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="row_group",
+                    query="SELECT age FROM customers",
+                    checks=[
+                        DQCheck(
+                            check_name="age_valid",
+                            metric_key="age",
+                            group_id="row_group",
+                            row_level=True,
+                        )
+                    ],
+                )
+            ]
+        )
+        planner = self._planner_with_db_hook(mock_db_hook)
+        result = planner.execute_plan(plan)
+        assert "age_valid" in result
+
+    def test_pure_aggregate_group_not_rejected(self):
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_records.return_value = [{"total": 100}]
+
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="agg_group",
+                    query="SELECT COUNT(*) AS total FROM customers",
+                    checks=[
+                        DQCheck(
+                            check_name="row_count",
+                            metric_key="total",
+                            group_id="agg_group",
+                            row_level=False,
+                        )
+                    ],
+                )
+            ]
+        )
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_db_hook,
+        )
+        result = planner.execute_plan(plan)
+        assert result["row_count"] == 100
+
+
+class TestIterDbRowChunks:
+    """_iter_db_row_chunks must fail fast on driver/query anomalies."""
+
+    @staticmethod
+    def _make_planner(cursor: MagicMock) -> SQLDQPlanner:
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = cursor
+        mock_hook = MagicMock(spec=DbApiHook)
+        mock_hook.get_conn.return_value = mock_conn
+        return SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_hook)
+
+    def test_raises_when_cursor_description_is_none(self):
+        cursor = MagicMock()
+        cursor.description = None
+        planner = self._make_planner(cursor)
+        with pytest.raises(ValueError, match="cursor.description is None"):
+            list(planner._iter_db_row_chunks("SELECT 1"))
+
+    def test_raises_for_unsupported_row_type(self):
+        cursor = MagicMock()
+        cursor.description = [("col", None, None, None, None, None, None)]
+        cursor.fetchmany.side_effect = [[42], []]
+        planner = self._make_planner(cursor)
+        with pytest.raises(ValueError, match="Unsupported row type"):
+            list(planner._iter_db_row_chunks("SELECT 1"))
+
+    def test_raises_when_tuple_length_mismatches_description(self):
+        cursor = MagicMock()
+        cursor.description = [("a", None, None, None, None, None, None)]
+        cursor.fetchmany.side_effect = [[(1, 2)], []]
+        planner = self._make_planner(cursor)
+        with pytest.raises(ValueError, match=r"1 column\(s\)"):
+            list(planner._iter_db_row_chunks("SELECT 1"))

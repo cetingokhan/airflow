@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from airflow.providers.common.ai.operators.llm import LLMOperator
 from airflow.providers.common.ai.utils.db_schema import get_db_hook
 from airflow.providers.common.ai.utils.dq_models import (
+    DQCheckFailedError,
     DQCheckGroup,
     DQCheckResult,
     DQPlan,
@@ -35,7 +36,7 @@ from airflow.providers.common.ai.utils.dq_models import (
     UnexpectedResult,
 )
 from airflow.providers.common.ai.utils.dq_validation import default_registry
-from airflow.providers.common.compat.sdk import AirflowException, Variable
+from airflow.providers.common.compat.sdk import Variable
 
 try:
     from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner
@@ -191,7 +192,7 @@ class LLMDataQualityOperator(LLMOperator):
             ``sample_violations`` rather than a raw scalar.
             When ``dry_run=True`` ``passed=None`` and ``results=None`` — no SQL
             is executed.  The ``plan`` key is always present in all modes.
-        :raises AirflowException: If any data-quality check fails threshold validation.
+        :raises DQCheckFailedError: If any data-quality check fails threshold validation.
         :raises TaskDeferred: When ``require_approval=True``, defers for human review
             before executing the checks.
         """
@@ -256,7 +257,7 @@ class LLMDataQualityOperator(LLMOperator):
         """
         Execute *plan* against the database, apply validators, and return the serialised report.
 
-        :raises AirflowException: If any data-quality check fails.
+        :raises DQCheckFailedError: If any data-quality check fails.
         """
         results_map = planner.execute_plan(plan)
         check_results = self._validate_results(results_map, plan)
@@ -307,7 +308,7 @@ class LLMDataQualityOperator(LLMOperator):
             # Push results to XCom before failing so downstream tasks
             # (e.g. with trigger_rule=all_done) can still inspect them.
             context["ti"].xcom_push(key="return_value", value=output)
-            raise AirflowException(report.failure_summary)
+            raise DQCheckFailedError(report.failure_summary)
 
         self.log.info("All %d data-quality check(s) passed.", len(report.results))
         return output
@@ -433,7 +434,9 @@ class LLMDataQualityOperator(LLMOperator):
         if not isinstance(self.prompts, dict):
             raise TypeError("prompts must be a dict[str, str] before generating a DQ plan.")
 
-        plan_hash = _compute_plan_hash(self.prompts, self.prompt_version, self.collect_unexpected)
+        plan_hash = _compute_plan_hash(
+            self.prompts, self.prompt_version, self.collect_unexpected, self.row_level_sample_size
+        )
         variable_key = f"{_PLAN_VARIABLE_PREFIX}{plan_hash}"
 
         cached_json = Variable.get(variable_key, default=None)
@@ -472,11 +475,17 @@ class LLMDataQualityOperator(LLMOperator):
         :returns: Per-check
             :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckResult`
             list in plan-group order.
+        :raises ValueError: If *results_map* is missing a key for any check in *plan*.
         """
         check_results: list[DQCheckResult] = []
 
         for group in plan.groups:
             for check in group.checks:
+                if check.check_name not in results_map:
+                    raise ValueError(
+                        f"Planner did not return a result for check {check.check_name!r} "
+                        f"(group {group.group_id!r}). Available keys: {sorted(results_map)}"
+                    )
                 value = results_map[check.check_name]
                 validator = self.validators.get(check.check_name)
 
@@ -484,14 +493,21 @@ class LLMDataQualityOperator(LLMOperator):
                 failure_reason: str | None = None
 
                 if isinstance(value, RowLevelResult):
-                    # Row-level check: evaluate threshold against invalid_pct.
-                    max_pct = getattr(validator, "_max_invalid_pct", 0.0)
-                    passed = value.invalid_pct <= max_pct
-                    if not passed:
-                        failure_reason = (
-                            f"Row-level check failed: {value.invalid}/{value.total} rows invalid "
-                            f"({value.invalid_pct:.4%}), threshold {max_pct:.4%}"
+                    if validator is None:
+                        self.log.warning(
+                            "No validator found for row-level check %r (metric key: %r). "
+                            "Marking as passed by default.",
+                            check.check_name,
+                            check.metric_key,
                         )
+                    else:
+                        max_pct = getattr(validator, "_max_invalid_pct", 0.0)
+                        passed = value.invalid_pct <= max_pct
+                        if not passed:
+                            failure_reason = (
+                                f"Row-level check failed: {value.invalid}/{value.total} rows invalid "
+                                f"({value.invalid_pct:.4%}), threshold {max_pct:.4%}"
+                            )
                 elif validator is not None:
                     try:
                         passed = bool(validator(value))
@@ -586,7 +602,7 @@ class LLMDataQualityOperator(LLMOperator):
         :param event: Trigger event payload from the HITL reviewer.
         :raises HITLRejectException: If the reviewer rejected the plan.
         :raises HITLTimeoutError: If the approval timed out.
-        :raises AirflowException: If any data-quality check fails after approval.
+        :raises DQCheckFailedError: If any data-quality check fails after approval.
         """
         approved_json = super().execute_complete(context, generated_output, event)
         plan = DQPlan.model_validate_json(approved_json)
@@ -598,18 +614,19 @@ def _compute_plan_hash(
     prompts: dict[str, str],
     prompt_version: str | None,
     collect_unexpected: bool = False,
+    row_level_sample_size: int | None = None,
 ) -> str:
     """
-    Return a short, stable hash of *prompts*, *prompt_version* and *collect_unexpected*.
+    Return a short, stable hash of *prompts*, *prompt_version*, *collect_unexpected*, and *row_level_sample_size*.
 
     Sorted serialisation ensures the hash is order-independent.
     The result is prefixed with the version tag so cache keys are human-readable.
-    ``collect_unexpected`` is included because enabling it changes the generated
-    plan (unexpected_query fields are populated).
     """
     payload = json.dumps(sorted(prompts.items()), sort_keys=True)
     if collect_unexpected:
         payload += ":unexpected=1"
+    if row_level_sample_size is not None:
+        payload += f":row_sample={row_level_sample_size}"
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
     version_tag = prompt_version or "default"
     max_tag_len = _PLAN_VARIABLE_KEY_MAX_LEN - len(digest) - 1  # -1 for the "_" separator

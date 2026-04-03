@@ -837,3 +837,83 @@ class TestLLMDataQualityOperatorRowLevel:
         md = op._build_dry_run_markdown(plan)
         assert "Row-Level Checks" in md
         assert "email_row_level" in md
+
+    def test_row_level_without_validator_passes_by_default(self):
+        """RowLevelResult with no registered validator must pass (mirrors aggregate behaviour)."""
+        row_result = RowLevelResult(
+            check_name="email_format",
+            total=100,
+            invalid=90,
+            invalid_pct=0.90,
+            sample_violations=["bad@"],
+            sample_size=10,
+        )
+        plan = _make_row_level_plan()
+        with (
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
+            ) as mock_var,
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True
+            ) as mock_planner_cls,
+            patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True),
+        ):
+            mock_var.get.return_value = None
+            mock_planner = mock_planner_cls.return_value
+            mock_planner.build_schema_context.return_value = ""
+            mock_planner.generate_plan.return_value = plan
+            mock_planner.execute_plan.return_value = {"email_format": row_result}
+
+            op = _make_operator(
+                prompts={"email_format": "Validate email column row by row"},
+                validators={},
+            )
+            result = op.execute(context=_make_context())
+
+        assert result["passed"] is True
+
+
+class TestValidateResultsMissingKey:
+    """_validate_results must raise ValueError when results_map is missing a check key."""
+
+    def test_raises_value_error_when_planner_returns_partial_results(self):
+        plan = _make_plan()
+
+        with (
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
+            ) as mock_var,
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True
+            ) as mock_planner_cls,
+            patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True),
+        ):
+            mock_var.get.return_value = None
+            mock_planner = mock_planner_cls.return_value
+            mock_planner.build_schema_context.return_value = ""
+            mock_planner.generate_plan.return_value = plan
+            # Planner only returns one of the two required check results.
+            mock_planner.execute_plan.return_value = {"null_emails": 0}
+
+            op = _make_operator(validators={"null_emails": lambda v: v == 0})
+            with pytest.raises(ValueError, match="dup_ids"):
+                op.execute(context=_make_context())
+
+
+class TestComputePlanHashRowLevelSampleSize:
+    """row_level_sample_size must be included in the cache key."""
+
+    def test_different_row_level_sample_size_yields_different_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=None)
+        h2 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=10_000)
+        assert h1 != h2
+
+    def test_same_row_level_sample_size_yields_same_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=5000)
+        h2 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=5000)
+        assert h1 == h2
+
+    def test_none_and_missing_sample_size_equivalent(self):
+        h1 = _compute_plan_hash(_PROMPTS, None)
+        h2 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=None)
+        assert h1 == h2

@@ -251,7 +251,7 @@ class SQLDQPlanner:
         self._validator_contexts = validator_contexts
         self._row_validators: dict[str, Any] = row_validators or {}
         self._row_level_sample_size = row_level_sample_size
-        # Populated by generate_plan; used by _retry_fix_group to continue the conversation.
+        self._cached_datafusion_engine: DataFusionEngine | None = None
         self._plan_agent: Agent[None, DQPlan] | None = None
         self._plan_all_messages: list[ModelMessage] | None = None
 
@@ -362,13 +362,23 @@ class SQLDQPlanner:
 
         datafusion_engine: DataFusionEngine | None = None
         if self._db_hook is None:
-            datafusion_engine = self._build_datafusion_engine()
+            if self._cached_datafusion_engine is None:
+                self._cached_datafusion_engine = self._build_datafusion_engine()
+            datafusion_engine = self._cached_datafusion_engine
 
         results: dict[str, Any] = {}
 
         for raw_group in plan.groups:
             group = self._validate_or_fix_group(raw_group)
             log.debug("Executing DQ group %r:\n%s", group.group_id, group.query)
+
+            row_level_flags = {check.row_level for check in group.checks}
+            if len(row_level_flags) > 1:
+                mixed = [(c.check_name, c.row_level) for c in group.checks]
+                raise ValueError(
+                    f"Group {group.group_id!r} contains both row-level and aggregate checks. "
+                    f"Every check in a group must be homogeneous. Checks: {mixed}"
+                )
 
             # Row-level checks and aggregate checks are mutually exclusive within a group
             # because the LLM places them in separate groups based on the system prompt.
@@ -435,7 +445,12 @@ class SQLDQPlanner:
                     try:
                         passed = bool(self._row_validators[check.check_name](value))
                     except Exception:
-                        # Treat any exception from the validator as a validation failure.
+                        log.debug(
+                            "Validator for check %r raised on value %r — treating row as invalid.",
+                            check.check_name,
+                            value,
+                            exc_info=True,
+                        )
                         passed = False
                     if not passed:
                         c[1] += 1  # invalid
@@ -478,7 +493,12 @@ class SQLDQPlanner:
         with closing(self._db_hook.get_conn()) as conn:  # type: ignore[union-attr]
             with closing(conn.cursor()) as cur:
                 cur.execute(query)
-                col_names = [str(desc[0]) for desc in cur.description] if cur.description else []
+                if cur.description is None:
+                    raise ValueError(
+                        "cursor.description is None after executing row-level query — "
+                        "the driver returned no column metadata."
+                    )
+                col_names = [str(desc[0]) for desc in cur.description]
                 while True:
                     chunk = cur.fetchmany(_ROW_LEVEL_CHUNK_SIZE)
                     if not chunk:
@@ -490,9 +510,18 @@ class SQLDQPlanner:
                         elif isinstance(raw_row, Sequence) and not isinstance(
                             raw_row, str | bytes | bytearray
                         ):
+                            if len(raw_row) != len(col_names):
+                                raise ValueError(
+                                    f"Row has {len(raw_row)} value(s) but cursor.description has "
+                                    f"{len(col_names)} column(s) ({col_names}). "
+                                    f"Possible driver or query mismatch."
+                                )
                             result_chunk.append(dict(zip(col_names, raw_row)))
                         else:
-                            result_chunk.append({})
+                            raise ValueError(
+                                f"Unsupported row type {type(raw_row).__name__!r} returned by "
+                                f"DB cursor. Expected dict or sequence."
+                            )
                     yield result_chunk
 
     @staticmethod
@@ -559,12 +588,18 @@ class SQLDQPlanner:
             return raw_row
 
         if isinstance(raw_row, Sequence) and not isinstance(raw_row, str | bytes | bytearray):
-            if len(raw_row) != len(metric_keys):
+            description = getattr(self._db_hook, "last_description", None)
+            col_names = (
+                [str(d[0]) for d in description]
+                if isinstance(description, (list, tuple)) and description
+                else metric_keys
+            )
+            if len(raw_row) != len(col_names):
                 raise ValueError(
                     f"Query for group {group.group_id!r} returned {len(raw_row)} value(s) but "
-                    f"{len(metric_keys)} metric key(s) are required ({metric_keys})."
+                    f"{len(col_names)} column(s) are expected ({col_names})."
                 )
-            return dict(zip(metric_keys, raw_row, strict=True))
+            return dict(zip(col_names, raw_row, strict=True))
 
         raise ValueError(
             f"Unsupported row type from DbApiHook.get_records for group {group.group_id!r}: "
@@ -733,7 +768,9 @@ class SQLDQPlanner:
 
         datafusion_engine: DataFusionEngine | None = None
         if self._db_hook is None:
-            datafusion_engine = self._build_datafusion_engine()
+            if self._cached_datafusion_engine is None:
+                self._cached_datafusion_engine = self._build_datafusion_engine()
+            datafusion_engine = self._cached_datafusion_engine
 
         results: dict[str, UnexpectedResult] = {}
 
