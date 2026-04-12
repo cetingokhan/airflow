@@ -24,6 +24,7 @@ import pytest
 if TYPE_CHECKING:
     from airflow.sdk.types import Context
 
+from airflow.providers.common.ai.hooks.pydantic_ai import PydanticAIHook
 from airflow.providers.common.ai.operators.llm_data_quality import (
     LLMDataQualityOperator,
     _compute_plan_hash,
@@ -94,7 +95,7 @@ def _make_operator(**overrides: Any) -> LLMDataQualityOperator:
     )
     defaults.update(overrides)
     op = LLMDataQualityOperator(**defaults)
-    op.llm_hook = MagicMock()
+    op.llm_hook = MagicMock(spec=PydanticAIHook)
     return op
 
 
@@ -285,6 +286,25 @@ class TestLLMDataQualityOperatorExecute:
                 validators={"null_emails": null_pct_check(max_pct=0.05)},
             )
         assert "null_emails" in str(exc_info.value)
+
+    def test_failure_reason_uses_validator_display(self):
+        name = "_test_failure_reason_display"
+        try:
+
+            @register_validator(name)
+            def _factory(*, max_pct: float):
+                return lambda v: float(v) <= max_pct
+
+            plan = _make_plan()
+            with pytest.raises(AirflowException) as exc_info:
+                self._run_operator(
+                    plan,
+                    {"null_emails": 0.2, "dup_ids": 0},
+                    validators={"null_emails": _factory(max_pct=0.1)},
+                )
+            assert f"{name}(max_pct=0.1) returned False" in str(exc_info.value)
+        finally:
+            default_registry.unregister(name)
 
     def test_failure_pushes_results_to_xcom_before_raising(self):
         """When checks fail, results are pushed to XCom before the exception is raised."""
@@ -631,20 +651,6 @@ class TestLLMDataQualityOperatorCollectUnexpected:
             mock_planner.execute_unexpected_queries.assert_not_called()
 
 
-class TestComputePlanHashCollectUnexpected:
-    """collect_unexpected changes the plan hash to avoid cache collisions."""
-
-    def test_different_collect_unexpected_yields_different_hash(self):
-        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=False)
-        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
-        assert h1 != h2
-
-    def test_same_collect_unexpected_yields_same_hash(self):
-        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
-        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
-        assert h1 == h2
-
-
 # ---------------------------------------------------------------------------
 # Row-level helpers
 # ---------------------------------------------------------------------------
@@ -827,6 +833,7 @@ class TestLLMDataQualityOperatorRowLevel:
         assert value["invalid"] == 1
         assert value["invalid_pct"] == 0.02
         assert value["sample_violations"] == ["bad"]
+        assert value["sample_size"] == 10
 
     def test_dry_run_markdown_contains_row_level_section(self):
         plan = _make_row_level_plan()
@@ -838,8 +845,8 @@ class TestLLMDataQualityOperatorRowLevel:
         assert "Row-Level Checks" in md
         assert "email_row_level" in md
 
-    def test_row_level_without_validator_passes_by_default(self):
-        """RowLevelResult with no registered validator must pass (mirrors aggregate behaviour)."""
+    def test_row_level_without_validator_fails(self):
+        """Row-level checks must fail when no validator is registered."""
         row_result = RowLevelResult(
             check_name="email_format",
             total=100,
@@ -868,9 +875,8 @@ class TestLLMDataQualityOperatorRowLevel:
                 prompts={"email_format": "Validate email column row by row"},
                 validators={},
             )
-            result = op.execute(context=_make_context())
-
-        assert result["passed"] is True
+            with pytest.raises(AirflowException, match="email_format"):
+                op.execute(context=_make_context())
 
 
 class TestValidateResultsMissingKey:
@@ -900,8 +906,18 @@ class TestValidateResultsMissingKey:
                 op.execute(context=_make_context())
 
 
-class TestComputePlanHashRowLevelSampleSize:
-    """row_level_sample_size must be included in the cache key."""
+class TestComputePlanHashExtendedInputs:
+    """Non-prompt inputs that must influence cache key generation."""
+
+    def test_different_collect_unexpected_yields_different_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=False)
+        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
+        assert h1 != h2
+
+    def test_same_collect_unexpected_yields_same_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
+        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True)
+        assert h1 == h2
 
     def test_different_row_level_sample_size_yields_different_hash(self):
         h1 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=None)
@@ -917,3 +933,146 @@ class TestComputePlanHashRowLevelSampleSize:
         h1 = _compute_plan_hash(_PROMPTS, None)
         h2 = _compute_plan_hash(_PROMPTS, None, row_level_sample_size=None)
         assert h1 == h2
+
+    def test_different_schema_context_yields_different_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, schema_context="Table: a\nColumns: id INT")
+        h2 = _compute_plan_hash(_PROMPTS, None, schema_context="Table: b\nColumns: email TEXT")
+        assert h1 != h2
+
+    def test_same_schema_context_yields_same_hash(self):
+        schema = "Table: customers\nColumns: id INT, email TEXT"
+        h1 = _compute_plan_hash(_PROMPTS, None, schema_context=schema)
+        h2 = _compute_plan_hash(_PROMPTS, None, schema_context=schema)
+        assert h1 == h2
+
+    def test_empty_and_missing_schema_context_equivalent(self):
+        h1 = _compute_plan_hash(_PROMPTS, None)
+        h2 = _compute_plan_hash(_PROMPTS, None, schema_context="")
+        assert h1 == h2
+
+    def test_different_unexpected_sample_size_with_collect_unexpected_yields_different_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True, unexpected_sample_size=50)
+        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True, unexpected_sample_size=200)
+        assert h1 != h2
+
+    def test_same_unexpected_sample_size_yields_same_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True, unexpected_sample_size=100)
+        h2 = _compute_plan_hash(_PROMPTS, None, collect_unexpected=True, unexpected_sample_size=100)
+        assert h1 == h2
+
+    def test_schema_context_combined_with_other_params(self):
+        """All hashing inputs together produce a unique key."""
+        h1 = _compute_plan_hash(
+            _PROMPTS, "v1", collect_unexpected=True, unexpected_sample_size=50, schema_context="schema A"
+        )
+        h2 = _compute_plan_hash(
+            _PROMPTS, "v1", collect_unexpected=True, unexpected_sample_size=50, schema_context="schema B"
+        )
+        assert h1 != h2
+
+    def test_different_validator_contexts_yield_different_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, validator_contexts="ctx A")
+        h2 = _compute_plan_hash(_PROMPTS, None, validator_contexts="ctx B")
+        assert h1 != h2
+
+    def test_same_validator_contexts_yield_same_hash(self):
+        h1 = _compute_plan_hash(_PROMPTS, None, validator_contexts="same")
+        h2 = _compute_plan_hash(_PROMPTS, None, validator_contexts="same")
+        assert h1 == h2
+
+    def test_different_row_validator_thresholds_yield_different_hash(self):
+        h1 = _compute_plan_hash(
+            _PROMPTS,
+            None,
+            row_validator_thresholds={"email_format": 0.01, "iban_valid": 0.0},
+        )
+        h2 = _compute_plan_hash(
+            _PROMPTS,
+            None,
+            row_validator_thresholds={"email_format": 0.05, "iban_valid": 0.0},
+        )
+        assert h1 != h2
+
+    def test_threshold_order_is_hash_stable(self):
+        h1 = _compute_plan_hash(
+            _PROMPTS,
+            None,
+            row_validator_thresholds={"a": 0.1, "b": 0.2},
+        )
+        h2 = _compute_plan_hash(
+            _PROMPTS,
+            None,
+            row_validator_thresholds={"b": 0.2, "a": 0.1},
+        )
+        assert h1 == h2
+
+
+class TestLLMDataQualityOperatorMissingMaxInvalidPct:
+    """Row-level validator without _max_invalid_pct defaults to 0.0 and logs a warning."""
+
+    def _run_row_level(self, invalid_pct: float, validator):
+        from airflow.providers.common.ai.utils.dq_models import RowLevelResult
+
+        row_plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT email FROM customers",
+                    checks=[
+                        DQCheck(
+                            check_name="email_valid",
+                            metric_key="email",
+                            group_id="g",
+                            row_level=True,
+                        )
+                    ],
+                )
+            ]
+        )
+        row_result = RowLevelResult(
+            check_name="email_valid",
+            total=100,
+            invalid=int(invalid_pct * 100),
+            invalid_pct=invalid_pct,
+            sample_violations=[],
+            sample_size=10,
+        )
+
+        with (
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
+            ) as mock_var,
+            patch(
+                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner", autospec=True
+            ) as mock_planner_cls,
+            patch("airflow.providers.common.ai.operators.llm_data_quality.get_db_hook", autospec=True),
+        ):
+            mock_var.get.return_value = None
+            mock_planner = mock_planner_cls.return_value
+            mock_planner.build_schema_context.return_value = ""
+            mock_planner.generate_plan.return_value = row_plan
+            mock_planner.execute_plan.return_value = {"email_valid": row_result}
+
+            op = _make_operator(
+                prompts={"email_valid": "check emails"},
+                validators={"email_valid": validator},
+            )
+            return op.execute(context=_make_context())
+
+    def test_zero_invalid_pct_passes_with_missing_max_invalid_pct(self):
+        """With no _max_invalid_pct, threshold is 0.0 — zero invalid rows should pass."""
+        validator = lambda v: v is not None
+        validator._row_level = True
+        # Deliberately no _max_invalid_pct attribute
+        result = self._run_row_level(0.0, validator)
+        assert result["passed"] is True
+
+    def test_nonzero_invalid_pct_fails_with_missing_max_invalid_pct(self):
+        """With no _max_invalid_pct, threshold is 0.0 — any invalid row should fail."""
+        from airflow.providers.common.compat.sdk import AirflowException
+
+        validator = lambda v: v is not None
+        validator._row_level = True
+        # Deliberately no _max_invalid_pct attribute
+        with pytest.raises(AirflowException):
+            self._run_row_level(0.01, validator)

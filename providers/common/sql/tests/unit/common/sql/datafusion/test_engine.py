@@ -124,6 +124,23 @@ class TestDataFusionEngine:
         with pytest.raises(ObjectStoreCreationException, match="Error while creating object store"):
             engine.register_datasource(datasource_config)
 
+    @patch("airflow.providers.common.sql.datafusion.engine.get_object_storage_provider", autospec=True)
+    @patch.object(DataFusionEngine, "_get_connection_config")
+    def test_register_datasource_object_store_exception_preserves_cause(self, mock_get_conn, mock_factory):
+        mock_get_conn.return_value = TEST_CONNECTION_CONFIG
+        mock_factory.side_effect = Exception("Provider error")
+
+        engine = DataFusionEngine()
+        datasource_config = DataSourceConfig(
+            conn_id="aws_default", table_name="test_table", uri="s3://bucket/path", format="parquet"
+        )
+
+        with pytest.raises(ObjectStoreCreationException) as exc_info:
+            engine.register_datasource(datasource_config)
+
+        assert exc_info.value.__cause__ is not None
+        assert "Provider error" in str(exc_info.value.__cause__)
+
     @patch.object(DataFusionEngine, "_get_connection_config")
     def test_register_datasource_duplicate_table(self, mock_get_conn):
         mock_get_conn.return_value = TEST_CONNECTION_CONFIG

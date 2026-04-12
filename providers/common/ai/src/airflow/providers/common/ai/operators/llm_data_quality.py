@@ -54,6 +54,20 @@ _PLAN_VARIABLE_PREFIX = "dq_plan_"
 _PLAN_VARIABLE_KEY_MAX_LEN = 200  # stay well under Airflow Variable key length limit
 
 
+def _describe_validator(validator: Callable[[Any], bool]) -> str:
+    """Return a human-readable validator label for failure messages."""
+    display = getattr(validator, "_validator_display", None)
+    if isinstance(display, str) and display:
+        return display
+    validator_name = getattr(validator, "_validator_name", None)
+    if isinstance(validator_name, str) and validator_name:
+        return validator_name
+    validator_name = getattr(validator, "__name__", None)
+    if isinstance(validator_name, str) and validator_name:
+        return validator_name
+    return repr(validator)
+
+
 class LLMDataQualityOperator(LLMOperator):
     """
     Generate and execute data-quality checks from natural language descriptions.
@@ -243,10 +257,15 @@ class LLMDataQualityOperator(LLMOperator):
             agent_params=self.agent_params,
             collect_unexpected=self.collect_unexpected,
             unexpected_sample_size=self.unexpected_sample_size,
-            validator_contexts=default_registry.build_llm_context(self.validators),
+            validator_contexts=self.validator_contexts,
             row_validators=self._collect_row_validators(),
             row_level_sample_size=self.row_level_sample_size,
         )
+
+    @cached_property
+    def validator_contexts(self) -> str:
+        """Return validator-specific LLM context rendered from configured validators."""
+        return default_registry.build_llm_context(self.validators)
 
     def _run_checks_and_report(
         self,
@@ -285,6 +304,7 @@ class LLMDataQualityOperator(LLMOperator):
                             "invalid": r.value.invalid,
                             "invalid_pct": r.value.invalid_pct,
                             "sample_violations": r.value.sample_violations,
+                            "sample_size": r.value.sample_size,
                         }
                         if isinstance(r.value, RowLevelResult)
                         else r.value
@@ -434,8 +454,17 @@ class LLMDataQualityOperator(LLMOperator):
         if not isinstance(self.prompts, dict):
             raise TypeError("prompts must be a dict[str, str] before generating a DQ plan.")
 
+        row_validator_thresholds = self._collect_row_validator_thresholds()
+
         plan_hash = _compute_plan_hash(
-            self.prompts, self.prompt_version, self.collect_unexpected, self.row_level_sample_size
+            self.prompts,
+            self.prompt_version,
+            self.collect_unexpected,
+            self.row_level_sample_size,
+            schema_context=schema_ctx,
+            unexpected_sample_size=self.unexpected_sample_size,
+            validator_contexts=self.validator_contexts,
+            row_validator_thresholds=row_validator_thresholds,
         )
         variable_key = f"{_PLAN_VARIABLE_PREFIX}{plan_hash}"
 
@@ -466,7 +495,9 @@ class LLMDataQualityOperator(LLMOperator):
         a :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`,
         the pass/fail decision compares ``invalid_pct`` against the validator's
         ``_max_invalid_pct`` attribute (defaulting to ``0.0`` when absent).
-        Checks without a registered validator are logged and marked as passed.
+        Aggregate checks without a registered validator are logged and marked
+        as passed; row-level checks require an explicit validator and fail
+        when none is provided.
 
         :param results_map: ``{check_name: metric_value_or_RowLevelResult}`` as
             returned by
@@ -494,13 +525,24 @@ class LLMDataQualityOperator(LLMOperator):
 
                 if isinstance(value, RowLevelResult):
                     if validator is None:
-                        self.log.warning(
+                        self.log.error(
                             "No validator found for row-level check %r (metric key: %r). "
-                            "Marking as passed by default.",
+                            "Row-level checks require an explicit validator.",
                             check.check_name,
                             check.metric_key,
                         )
+                        passed = False
+                        failure_reason = (
+                            "Row-level check requires a registered row-level validator, "
+                            "but none was provided."
+                        )
                     else:
+                        if not hasattr(validator, "_max_invalid_pct"):
+                            self.log.warning(
+                                "Row-level validator for check %r has no '_max_invalid_pct' attribute — "
+                                "defaulting threshold to 0.0%%. Every invalid row will fail the check.",
+                                check.check_name,
+                            )
                         max_pct = getattr(validator, "_max_invalid_pct", 0.0)
                         passed = value.invalid_pct <= max_pct
                         if not passed:
@@ -516,7 +558,7 @@ class LLMDataQualityOperator(LLMOperator):
                         failure_reason = str(exc)
 
                     if not passed and failure_reason is None:
-                        failure_reason = f"{repr(validator)} returned False"
+                        failure_reason = f"{_describe_validator(validator)} returned False"
                 else:
                     self.log.warning(
                         "No validator found for check %r (metric key: %r). Marking as passed by default.",
@@ -539,6 +581,19 @@ class LLMDataQualityOperator(LLMOperator):
     def _collect_row_validators(self) -> dict[str, Callable[[Any], bool]]:
         """Return the subset of validators that are row-level."""
         return {name: fn for name, fn in self.validators.items() if default_registry.is_row_level(fn)}
+
+    def _collect_row_validator_thresholds(self) -> dict[str, float | str | None]:
+        """Return a deterministic ``{check_name: threshold}`` map for row-level validators."""
+        thresholds: dict[str, float | str | None] = {}
+        for name, validator in self._collect_row_validators().items():
+            raw_threshold = getattr(validator, "_max_invalid_pct", None)
+            if isinstance(raw_threshold, int | float):
+                thresholds[name] = float(raw_threshold)
+            elif raw_threshold is None:
+                thresholds[name] = None
+            else:
+                thresholds[name] = str(raw_threshold)
+        return thresholds
 
     @staticmethod
     def _attach_unexpected(
@@ -615,16 +670,31 @@ def _compute_plan_hash(
     prompt_version: str | None,
     collect_unexpected: bool = False,
     row_level_sample_size: int | None = None,
+    schema_context: str = "",
+    unexpected_sample_size: int = 100,
+    validator_contexts: str = "",
+    row_validator_thresholds: dict[str, float | str | None] | None = None,
 ) -> str:
     """
-    Return a short, stable hash of *prompts*, *prompt_version*, *collect_unexpected*, and *row_level_sample_size*.
+    Return a short, stable hash of the inputs that determine a unique DQ plan.
 
+    Includes *prompts*, *prompt_version*, *collect_unexpected*,
+    *row_level_sample_size*, *schema_context*, *unexpected_sample_size*,
+    *validator_contexts*, and *row_validator_thresholds*.
     Sorted serialisation ensures the hash is order-independent.
     The result is prefixed with the version tag so cache keys are human-readable.
     """
     payload = json.dumps(sorted(prompts.items()), sort_keys=True)
+    if schema_context:
+        payload += f":schema={hashlib.sha256(schema_context.encode()).hexdigest()[:16]}"
+    if validator_contexts:
+        payload += f":validator_contexts={hashlib.sha256(validator_contexts.encode()).hexdigest()[:16]}"
+    if row_validator_thresholds:
+        payload += ":row_thresholds=" + json.dumps(
+            row_validator_thresholds, sort_keys=True, separators=(",", ":")
+        )
     if collect_unexpected:
-        payload += ":unexpected=1"
+        payload += f":unexpected=1:unexpected_sample={unexpected_sample_size}"
     if row_level_sample_size is not None:
         payload += f":row_sample={row_level_sample_size}"
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]

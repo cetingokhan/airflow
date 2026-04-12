@@ -143,9 +143,10 @@ class RowLevelResult:
     :param invalid: Number of rows for which the validator returned ``False``.
     :param invalid_pct: Fraction of invalid rows (``invalid / total``), or ``0.0``
         when *total* is zero.
-    :param sample_violations: Up to ``sample_size`` values that failed validation,
-        as strings.
-    :param sample_size: Maximum number of violations collected.
+    :param sample_violations: Sampled failing values as strings, capped by an
+        internal planner limit.
+    :param sample_size: Number of sampled failing values (equivalent to
+        ``len(sample_violations)``).
     """
 
     check_name: str

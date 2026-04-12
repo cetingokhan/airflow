@@ -196,7 +196,7 @@ class TestSQLDQPlannerGeneratePlan:
 
 class TestSQLDQPlannerExecutePlan:
     def test_returns_flat_check_name_to_value_map(self):
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [{"null_email_count": 5}]
 
         plan = DQPlan(
@@ -220,7 +220,7 @@ class TestSQLDQPlannerExecutePlan:
         assert results["null_emails"] == 5
 
     def test_raises_safety_error_for_unsafe_sql(self):
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         plan = DQPlan(
             groups=[
                 DQCheckGroup(
@@ -237,7 +237,7 @@ class TestSQLDQPlannerExecutePlan:
         mock_db_hook.get_records.assert_not_called()
 
     def test_raises_when_metric_key_missing_from_result(self):
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [{"wrong_column": 0}]
 
         plan = DQPlan(
@@ -253,15 +253,9 @@ class TestSQLDQPlannerExecutePlan:
         with pytest.raises(ValueError, match="expected_column"):
             planner.execute_plan(plan)
 
-    def test_raises_when_db_hook_is_none(self):
-        plan = _make_plan("some_check")
-        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
-        with pytest.raises(ValueError, match="db_conn_id|datasource_config"):
-            planner.execute_plan(plan)
-
     def test_handles_tuple_rows_from_get_records(self):
         """get_records may return plain tuples; ensure positional mapping works."""
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [(42,)]
 
         plan = DQPlan(
@@ -279,7 +273,7 @@ class TestSQLDQPlannerExecutePlan:
 
     def test_raises_when_tuple_length_does_not_match_metric_keys(self):
         """Tuple-shaped rows must match the number of expected metric keys."""
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [(1, 2)]
 
         plan = DQPlan(
@@ -298,7 +292,7 @@ class TestSQLDQPlannerExecutePlan:
 
     def test_raises_for_unsupported_row_type(self):
         """Unexpected row types should fail fast with a clear error."""
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [1]
 
         plan = DQPlan(
@@ -316,8 +310,8 @@ class TestSQLDQPlannerExecutePlan:
             planner.execute_plan(plan)
 
 
-class TestSQLDQPlannerDataFusion:
-    """Tests for the DataFusion (object-storage) execution path."""
+class TestSQLDQPlannerExecutionBackends:
+    """Tests for backend selection and DataFusion execution path."""
 
     def _simple_plan(self, metric_key: str = "null_count") -> DQPlan:
         return DQPlan(
@@ -421,7 +415,7 @@ class TestSQLDQPlannerDataFusion:
 
     def test_db_path_preferred_when_both_db_hook_and_datasource_set(self):
         """When both db_hook and datasource_config are set, the DB path is used."""
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [{"null_count": 5}]
 
         planner = SQLDQPlanner(
@@ -455,7 +449,7 @@ class TestSQLDQPlannerDialect:
     @patch("airflow.providers.common.ai.utils.dq_planner._validate_sql")
     def test_dialect_passed_to_validate_sql(self, mock_validate):
         mock_validate.return_value = []
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_records.return_value = [{"c": 1}]
 
         plan = DQPlan(
@@ -944,6 +938,21 @@ class TestSQLDQPlannerRowLevel:
     # DataFusion path
     # ------------------------------------------------------------------
 
+    def test_raises_when_row_level_validator_is_missing(self):
+        """Row-level checks without matching validators must fail fast."""
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=None,
+            datasource_config=MagicMock(),
+            row_validators={},
+        )
+
+        with pytest.raises(ValueError, match="requires row-level validator"):
+            planner._execute_row_level_group(
+                _make_row_level_plan().groups[0],
+                datafusion_engine=MagicMock(),
+            )
+
     def test_datafusion_empty_query_returns_zero_total(self):
         """DataFusion iter_query_row_chunks yielding no batches must produce total=0."""
         mock_engine = MagicMock()
@@ -1118,6 +1127,7 @@ class TestSQLDQPlannerRowLevel:
         assert r.invalid == num_invalid
         # Violation list is capped — must not grow unboundedly.
         assert len(r.sample_violations) == _MAX_VIOLATION_SAMPLES
+        assert r.sample_size == len(r.sample_violations)
         assert r.sample_size == _MAX_VIOLATION_SAMPLES
 
     def test_db_dict_rows_processed_correctly(self):
@@ -1303,3 +1313,132 @@ class TestIterDbRowChunks:
         planner = self._make_planner(cursor)
         with pytest.raises(ValueError, match=r"1 column\(s\)"):
             list(planner._iter_db_row_chunks("SELECT 1"))
+
+
+class TestSQLDQPlannerDuplicateCheckName:
+    """Duplicate check_name entries in LLM-generated plans must be rejected."""
+
+    def test_raises_when_plan_has_duplicate_check_names(self):
+        """A plan where the same check_name appears in two groups must raise ValueError."""
+        prompts = {"null_emails": "check for null emails"}
+        # LLM returns check_name "null_emails" in two separate groups (duplicate)
+        duplicate_plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g1",
+                    query="SELECT COUNT(*) AS a FROM t",
+                    checks=[DQCheck(check_name="null_emails", metric_key="a", group_id="g1")],
+                ),
+                DQCheckGroup(
+                    group_id="g2",
+                    query="SELECT COUNT(*) AS b FROM t",
+                    checks=[DQCheck(check_name="null_emails", metric_key="b", group_id="g2")],
+                ),
+            ]
+        )
+        mock_hook = _make_llm_hook(duplicate_plan)
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+        with pytest.raises(ValueError, match="null_emails"):
+            planner.generate_plan(prompts, schema_context="")
+
+    def test_unique_check_names_do_not_raise(self):
+        """A plan with all unique check_names must pass coverage validation."""
+        prompts = {"check_a": "...", "check_b": "..."}
+        valid_plan = _make_plan("check_a", "check_b")
+        mock_hook = _make_llm_hook(valid_plan)
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+        result = planner.generate_plan(prompts, schema_context="")
+        assert set(result.check_names) == {"check_a", "check_b"}
+
+
+class TestSQLDQPlannerRowLevelMetricKeyValidation:
+    """Row-level queries not returning the required metric_key column must fail fast."""
+
+    def _make_row_level_group(self, metric_key: str = "email") -> DQCheckGroup:
+        return DQCheckGroup(
+            group_id="g",
+            query=f"SELECT {metric_key} FROM customers",
+            checks=[
+                DQCheck(
+                    check_name="null_check",
+                    metric_key=metric_key,
+                    group_id="g",
+                    row_level=True,
+                )
+            ],
+        )
+
+    def _make_row_validator(self):
+        def _v(v):
+            return v is not None
+
+        _v._row_level = True
+        _v._max_invalid_pct = 0.05
+        return _v
+
+    def test_raises_when_row_does_not_contain_metric_key(self):
+        """First chunk with wrong column name should raise ValueError naming the missing key."""
+        mock_hook = MagicMock(spec=DbApiHook)
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_hook,
+            row_validators={"null_check": self._make_row_validator()},
+        )
+        group = self._make_row_level_group(metric_key="email")
+        # Iterator returns row with "wrong_col" instead of "email"
+        with patch.object(planner, "_iter_db_row_chunks", return_value=iter([[{"wrong_col": "value"}]])):
+            with pytest.raises(ValueError, match="email"):
+                planner._execute_row_level_group(group, None)
+
+    def test_correct_metric_key_processes_without_error(self):
+        """First chunk with the correct metric_key column should process all rows."""
+        mock_hook = MagicMock(spec=DbApiHook)
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=mock_hook,
+            row_validators={"null_check": self._make_row_validator()},
+        )
+        group = self._make_row_level_group(metric_key="email")
+        with patch.object(
+            planner,
+            "_iter_db_row_chunks",
+            return_value=iter([[{"email": "a@b.com"}, {"email": None}, {"email": "c@d.com"}]]),
+        ):
+            results = planner._execute_row_level_group(group, None)
+
+        assert "null_check" in results
+        assert results["null_check"].total == 3
+        assert results["null_check"].invalid == 1  # None row
+
+
+class TestIterDataFusionRowChunks:
+    """_iter_datafusion_row_chunks must validate column lengths within each batch."""
+
+    def test_raises_when_column_lengths_are_inconsistent(self):
+        """A batch where columns have different lengths should raise ValueError."""
+        mock_engine = MagicMock()
+        mock_engine.iter_query_row_chunks.return_value = iter(
+            [{"id": [1, 2], "email": [None]}]  # id has 2 values, email has 1
+        )
+        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
+        with pytest.raises(ValueError, match="inconsistent column lengths"):
+            list(planner._iter_datafusion_row_chunks(mock_engine, "SELECT id, email FROM t"))
+
+    def test_consistent_column_lengths_yield_correct_rows(self):
+        """Batches with equal-length columns should be transposed to row dicts correctly."""
+        mock_engine = MagicMock()
+        mock_engine.iter_query_row_chunks.return_value = iter(
+            [{"id": [1, 2], "email": ["a@b.com", "c@d.com"]}]
+        )
+        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
+        rows = list(planner._iter_datafusion_row_chunks(mock_engine, "SELECT id, email FROM t"))
+
+        assert rows == [[{"id": 1, "email": "a@b.com"}, {"id": 2, "email": "c@d.com"}]]
+
+    def test_empty_col_dict_is_skipped(self):
+        """Empty column dicts should not produce any output rows."""
+        mock_engine = MagicMock()
+        mock_engine.iter_query_row_chunks.return_value = iter([{}])
+        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
+        rows = list(planner._iter_datafusion_row_chunks(mock_engine, "SELECT 1"))
+        assert rows == []

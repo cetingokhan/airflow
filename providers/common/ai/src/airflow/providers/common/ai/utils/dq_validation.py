@@ -140,46 +140,33 @@ class ValidatorRegistry:
         def _decorator(
             factory: Callable[..., Callable[[Any], bool]],
         ) -> Callable[..., Callable[[Any], bool]]:
-            self._entries[name] = ValidatorEntry(
-                factory=factory,
-                llm_context=llm_context,
-                check_category=check_category,
-                row_level=row_level,
-            )
-
-            # Wrap the factory so every closure it returns carries the full set of
-            # introspection attributes.  Factory authors no longer need to stamp these
-            # manually — the decorator handles it automatically.
+            # Wrap the factory so every closure it returns carries introspection
+            # attributes used by the operator and planner.
             def _wrapped_factory(*args: Any, **kwargs: Any) -> Callable[[Any], bool]:
                 closure = factory(*args, **kwargs)
-                # Build a human-readable call representation.
                 arg_parts = [repr(a) for a in args]
-                kwarg_parts = [f"{k}={v!r}" for k, v in kwargs.items()]
+                kwarg_parts = [f"{k}={v!r}" for k, v in sorted(kwargs.items())]
                 call_str = f"{name}({', '.join(arg_parts + kwarg_parts)})"
-                # Stamp only when the factory has not set the attribute explicitly.
                 if not hasattr(closure, "_validator_name"):
                     closure._validator_name = name  # type: ignore[attr-defined]
                 if not hasattr(closure, "_row_level"):
                     closure._row_level = row_level  # type: ignore[attr-defined]
-                for k, v in kwargs.items():
+                if not hasattr(closure, "_validator_display"):
+                    closure._validator_display = call_str  # type: ignore[attr-defined]
+                for k, v in sorted(kwargs.items()):
                     if not hasattr(closure, f"_{k}"):
                         setattr(closure, f"_{k}", v)  # e.g. _max_pct, _min_count
-                if ".<locals>." in closure.__qualname__:
-                    closure.__qualname__ = call_str
-                if "__repr__" not in closure.__dict__:
-                    closure.__repr__ = lambda: call_str  # type: ignore[method-assign]
                 return closure
 
-            # Preserve factory identity attributes on the wrapper.
             _wrapped_factory._validator_name = name  # type: ignore[attr-defined]
             _wrapped_factory._llm_context = llm_context  # type: ignore[attr-defined]
             _wrapped_factory._check_category = check_category  # type: ignore[attr-defined]
             _wrapped_factory._row_level = row_level  # type: ignore[attr-defined]
+            _wrapped_factory._validator_display = name  # type: ignore[attr-defined]
             _wrapped_factory.__name__ = factory.__name__
             _wrapped_factory.__qualname__ = factory.__qualname__
             _wrapped_factory.__doc__ = factory.__doc__
 
-            # Update the registry entry to point to the wrapped factory.
             self._entries[name] = ValidatorEntry(
                 factory=_wrapped_factory,
                 llm_context=llm_context,
@@ -214,8 +201,8 @@ class ValidatorRegistry:
         Checks the ``_row_level`` attribute set by the factory closure and,
         as a fallback, the registry entry for the factory name.
         """
-        if getattr(validator, "_row_level", False):
-            return True
+        if hasattr(validator, "_row_level"):
+            return bool(validator._row_level)
         factory_name: str | None = getattr(validator, "_validator_name", None)
         if factory_name and factory_name in self._entries:
             return self._entries[factory_name].row_level
@@ -465,6 +452,12 @@ def between_check(*, min_val: float, max_val: float) -> Callable[[Any], bool]:
 def exact_check(*, expected: Any) -> Callable[[Any], bool]:
     """
     Return a validator that passes when ``value == expected``.
+
+    .. note::
+        Comparison uses Python's ``==`` operator without type coercion.
+        ``Decimal(0) == 0`` passes (Python numeric promotion), but
+        ``"0" == 0`` does not.  The behaviour depends on the DB driver's
+        Python type for the returned column.
 
     :param expected: The exact value the metric must equal.
     """

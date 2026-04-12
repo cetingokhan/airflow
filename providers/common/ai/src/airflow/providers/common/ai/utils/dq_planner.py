@@ -415,12 +415,16 @@ class SQLDQPlanner:
         :param datafusion_engine: Active DataFusion engine or ``None`` for DB.
         :returns: ``{check_name: RowLevelResult}`` for every row-level check.
         """
-        active_checks = [
-            check for check in group.checks if check.row_level and check.check_name in self._row_validators
+        active_checks = [check for check in group.checks if check.row_level]
+        missing_validators = [
+            check.check_name for check in active_checks if check.check_name not in self._row_validators
         ]
-        for check in group.checks:
-            if check.row_level and check.check_name not in self._row_validators:
-                log.warning("No row-level validator found for check %r — skipping.", check.check_name)
+        if missing_validators:
+            raise ValueError(
+                f"Row-level group {group.group_id!r} requires row-level validator(s) for "
+                f"check(s) {sorted(missing_validators)}. "
+                f"Configured row-level validators: {sorted(self._row_validators)}"
+            )
 
         if not active_checks:
             return {}
@@ -435,7 +439,18 @@ class SQLDQPlanner:
             chunk_iter = self._iter_db_row_chunks(group.query)
 
         total_rows_seen = 0
+        first_chunk = True
         for chunk in chunk_iter:
+            if first_chunk and chunk:
+                first_row = chunk[0]
+                missing_keys = [c.metric_key for c in active_checks if c.metric_key not in first_row]
+                if missing_keys:
+                    raise ValueError(
+                        f"Row-level query for group {group.group_id!r} did not return "
+                        f"column(s) {missing_keys} required by the active checks. "
+                        f"Available columns: {list(first_row.keys())}"
+                    )
+                first_chunk = False
             total_rows_seen += len(chunk)
             for row in chunk:
                 for check in active_checks:
@@ -470,7 +485,7 @@ class SQLDQPlanner:
                 invalid=invalid,
                 invalid_pct=invalid_pct,
                 sample_violations=violations,
-                sample_size=_MAX_VIOLATION_SAMPLES if total else 0,
+                sample_size=len(violations),
             )
             log.info(
                 "Row-level check %r: %d/%d invalid (%.4f%%)",
@@ -538,7 +553,14 @@ class SQLDQPlanner:
             if not col_dict:
                 continue
             col_names = list(col_dict.keys())
-            n = len(next(iter(col_dict.values())))
+            col_lengths = {col: len(vals) for col, vals in col_dict.items()}
+            unique_lengths = set(col_lengths.values())
+            if len(unique_lengths) > 1:
+                raise ValueError(
+                    f"DataFusion batch has inconsistent column lengths: {col_lengths}. "
+                    "Arrow RecordBatch columns must all have the same length."
+                )
+            n = next(iter(unique_lengths))
             yield [{col: col_dict[col][i] for col in col_names} for i in range(n)]
 
     def _build_datafusion_engine(self) -> DataFusionEngine:
@@ -589,11 +611,17 @@ class SQLDQPlanner:
 
         if isinstance(raw_row, Sequence) and not isinstance(raw_row, str | bytes | bytearray):
             description = getattr(self._db_hook, "last_description", None)
-            col_names = (
-                [str(d[0]) for d in description]
-                if isinstance(description, (list, tuple)) and description
-                else metric_keys
-            )
+            if isinstance(description, (list, tuple)) and description:
+                col_names = [str(d[0]) for d in description]
+            else:
+                log.warning(
+                    "Hook %r does not expose 'last_description' — falling back to positional "
+                    "column mapping via metric_keys. Ensure SQL column order matches check order "
+                    "in group %r.",
+                    type(self._db_hook).__name__,
+                    group.group_id,
+                )
+                col_names = metric_keys
             if len(raw_row) != len(col_names):
                 raise ValueError(
                     f"Query for group {group.group_id!r} returned {len(raw_row)} value(s) but "
@@ -859,7 +887,14 @@ class SQLDQPlanner:
         (LLM hallucinated a check not in the prompts) in a single error message.
         """
         expected = set(prompts.keys())
-        returned = set(plan.check_names)
+        returned_list = plan.check_names
+        if len(returned_list) != len(set(returned_list)):
+            duplicates = sorted({n for n in returned_list if returned_list.count(n) > 1})
+            raise ValueError(
+                f"LLM-generated DQPlan contains duplicate check_name entries: {duplicates}. "
+                "Each check_name must be unique within a plan."
+            )
+        returned = set(returned_list)
 
         missing = expected - returned
         extra = returned - expected

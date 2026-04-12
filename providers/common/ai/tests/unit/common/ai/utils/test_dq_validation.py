@@ -50,10 +50,9 @@ class TestNullPctCheck:
         with pytest.raises(TypeError, match="null_pct_check"):
             null_pct_check(max_pct=0.05)("not-a-number")
 
-    def test_repr_contains_threshold(self):
+    def test_display_contains_threshold(self):
         fn = null_pct_check(max_pct=0.05)
-        assert "0.05" in repr(fn)
-        assert "null_pct_check" in repr(fn)
+        assert fn._validator_display == "null_pct_check(max_pct=0.05)"
 
 
 class TestRowCountCheck:
@@ -73,10 +72,9 @@ class TestRowCountCheck:
         with pytest.raises(TypeError, match="row_count_check"):
             row_count_check(min_count=100)(None)
 
-    def test_repr_contains_threshold(self):
+    def test_display_contains_threshold(self):
         fn = row_count_check(min_count=500)
-        assert "500" in repr(fn)
-        assert "row_count_check" in repr(fn)
+        assert fn._validator_display == "row_count_check(min_count=500)"
 
 
 class TestDuplicatePctCheck:
@@ -93,9 +91,9 @@ class TestDuplicatePctCheck:
         with pytest.raises(TypeError, match="duplicate_pct_check"):
             duplicate_pct_check(max_pct=0.01)(object())
 
-    def test_repr_contains_threshold(self):
+    def test_display_contains_threshold(self):
         fn = duplicate_pct_check(max_pct=0.02)
-        assert "0.02" in repr(fn)
+        assert fn._validator_display == "duplicate_pct_check(max_pct=0.02)"
 
 
 class TestBetweenCheck:
@@ -122,10 +120,9 @@ class TestBetweenCheck:
         with pytest.raises(TypeError, match="between_check"):
             between_check(min_val=0.0, max_val=10.0)("abc")
 
-    def test_repr_contains_bounds(self):
+    def test_display_contains_bounds(self):
         fn = between_check(min_val=1.0, max_val=9.0)
-        assert "1.0" in repr(fn)
-        assert "9.0" in repr(fn)
+        assert fn._validator_display == "between_check(min_val=1.0, max_val=9.0)"
 
 
 class TestExactCheck:
@@ -141,10 +138,9 @@ class TestExactCheck:
     def test_works_with_none(self):
         assert exact_check(expected=None)(None) is True
 
-    def test_repr_contains_expected(self):
+    def test_display_contains_expected(self):
         fn = exact_check(expected=42)
-        assert "42" in repr(fn)
-        assert "exact_check" in repr(fn)
+        assert fn._validator_display == "exact_check(expected=42)"
 
 
 class TestValidatorRegistry:
@@ -388,7 +384,7 @@ class TestRowLevelRegistry:
         finally:
             default_registry.unregister(name)
 
-    def test_qualname_set_to_human_readable(self):
+    def test_validator_display_set_to_human_readable(self):
         name = "_test_as_qualname"
         try:
 
@@ -397,11 +393,11 @@ class TestRowLevelRegistry:
                 return lambda v: float(v) <= threshold
 
             fn = _factory(threshold=0.1)
-            assert fn.__qualname__ == f"{name}(threshold=0.1)"
+            assert fn._validator_display == f"{name}(threshold=0.1)"
         finally:
             default_registry.unregister(name)
 
-    def test_repr_returns_human_readable_string(self):
+    def test_validator_display_contains_call_signature(self):
         name = "_test_as_repr"
         try:
 
@@ -410,11 +406,7 @@ class TestRowLevelRegistry:
                 return lambda v: float(v) <= max_pct
 
             fn = _factory(max_pct=0.03)
-            # repr() embeds __qualname__ → human-readable substring
-            assert name in repr(fn)
-            assert "max_pct=0.03" in repr(fn)
-            # Direct __repr__() call returns the full call string
-            assert fn.__repr__() == f"{name}(max_pct=0.03)"
+            assert fn._validator_display == f"{name}(max_pct=0.03)"
         finally:
             default_registry.unregister(name)
 
@@ -439,7 +431,4 @@ class TestRowLevelRegistry:
         assert fn._validator_name == "null_pct_check"
         assert fn._row_level is False
         assert fn._max_pct == 0.05
-        assert fn.__qualname__ == "null_pct_check(max_pct=0.05)"
-        assert "null_pct_check" in repr(fn)
-        assert "max_pct=0.05" in repr(fn)
-        assert fn.__repr__() == "null_pct_check(max_pct=0.05)"
+        assert fn._validator_display == "null_pct_check(max_pct=0.05)"

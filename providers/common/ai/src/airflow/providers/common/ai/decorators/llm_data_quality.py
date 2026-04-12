@@ -75,8 +75,7 @@ class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
         op_kwargs: Mapping[str, Any] | None = None,
         **kwargs,
     ) -> None:
-        # prompts will be populated by the callable at execution time.
-        # _validate_validator_keys is skipped at init when prompts is not a dict.
+        # Defer prompt validation until execute() populates prompts from python_callable.
         super().__init__(
             python_callable=python_callable,
             op_args=op_args,
@@ -96,7 +95,6 @@ class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
                 "The returned value from the @task.llm_dq callable must be a non-empty dict[str, str]."
             )
 
-        # Now that prompts is populated, validate that all validator keys are present.
         self._validate_validator_keys()
 
         self.render_template_fields(context)

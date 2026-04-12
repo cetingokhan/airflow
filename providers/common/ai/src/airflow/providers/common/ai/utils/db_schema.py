@@ -102,7 +102,6 @@ def build_schema_context(
     :param schema_context: Manual schema description; bypasses introspection when set.
     :param datasource_config: DataFusion datasource config for object-storage schema.
     :raises ValueError: If *table_names* are provided but none yield schema information.
-    :raises ValueError: If *datasource_config* is ``None`` and no DB tables are available.
     """
     if schema_context:
         return schema_context

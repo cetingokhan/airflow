@@ -101,8 +101,10 @@ You can also use plain lambdas for one-off conditions::
         "revenue_range": lambda v: 0.0 <= float(v) <= 1_000_000.0,
     }
 
-Checks without a validator are always marked as **passed** — metrics are still
-collected and included in the report, but no threshold is enforced.
+Aggregate checks without a validator are marked as **passed** — metrics are
+still collected and included in the report, but no threshold is enforced.
+Row-level checks are stricter: each row-level check must have a corresponding
+row-level validator, otherwise execution fails fast.
 
 Custom Validators with ``register_validator``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -248,14 +250,18 @@ dict with the following keys:
        is zero.
    * - ``sample_violations``
      - ``list[str]``
-     - Up to ``sample_size`` string representations of failing values.
+     - String representations of sampled failing values (capped internally).
    * - ``sample_size``
      - ``int``
-     - The configured violation sample cap.
+     - Number of returned sampled violations (``len(sample_violations)``).
 
 The check **passes** when ``invalid_pct ≤ max_invalid_pct`` (the
 ``_max_invalid_pct`` attribute on the validator callable, defaulting to
 ``0.0``).
+
+If a row-level check is present in the generated plan but no matching
+row-level validator is configured, the operator raises ``ValueError`` and
+stops execution.
 
 ``row_level_sample_size``
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -290,7 +296,9 @@ Cache key
 ~~~~~~~~~
 
 The cache key is derived from a SHA-256 digest of the sorted ``prompts`` dict
-combined with ``prompt_version``.  The key format is::
+plus all planning-affecting inputs: ``prompt_version``, schema context,
+unexpected-row collection settings, row-level sample size, validator LLM
+context, and row-level validator thresholds. The key format is::
 
     dq_plan_{version_tag}_{sha256[:16]}
 
