@@ -122,7 +122,7 @@ class TestBetweenCheck:
 
     def test_display_contains_bounds(self):
         fn = between_check(min_val=1.0, max_val=9.0)
-        assert fn._validator_display == "between_check(min_val=1.0, max_val=9.0)"
+        assert fn._validator_display == "between_check(max_val=9.0, min_val=1.0)"
 
 
 class TestExactCheck:
