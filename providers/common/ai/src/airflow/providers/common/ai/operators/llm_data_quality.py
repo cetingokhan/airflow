@@ -468,7 +468,7 @@ class LLMDataQualityOperator(LLMOperator):
         )
         variable_key = f"{_PLAN_VARIABLE_PREFIX}{plan_hash}"
 
-        cached_json = Variable.get(variable_key, default=None)
+        cached_json = Variable.get(variable_key, default_var=None)
         if cached_json is not None:
             self.log.info("DQ plan cache hit — key: %r", variable_key)
             plan = DQPlan.model_validate_json(cached_json)
