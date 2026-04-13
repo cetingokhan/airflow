@@ -22,7 +22,7 @@ import pytest
 
 from airflow.providers.common.ai.hooks.pydantic_ai import PydanticAIHook
 from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan
-from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner
+from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner, _extract_table_names
 from airflow.providers.common.ai.utils.sql_validation import SQLSafetyError
 from airflow.providers.common.sql.hooks.sql import DbApiHook
 
@@ -65,7 +65,7 @@ class TestSQLDQPlannerBuildSchema:
         assert result == "Table: t\nColumns: id INT"
 
     def test_introspects_via_db_hook_when_no_manual_context(self):
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
         mock_db_hook.get_table_schema.return_value = [{"name": "id", "type": "INT"}]
 
         planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook)
@@ -79,7 +79,7 @@ class TestSQLDQPlannerBuildSchema:
         assert "id INT" in result
 
     def test_manual_context_takes_priority_over_db_hook(self):
-        mock_db_hook = MagicMock()
+        mock_db_hook = MagicMock(spec=DbApiHook)
 
         planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook)
         result = planner.build_schema_context(
@@ -192,6 +192,27 @@ class TestSQLDQPlannerGeneratePlan:
         # Only output_type and instructions should be present — no extra kwargs.
         extra = {k: v for k, v in call_kwargs.kwargs.items() if k not in ("output_type", "instructions")}
         assert extra == {}
+
+    def test_prompt_bodies_logged_at_debug_only(self, caplog):
+        prompts = {"row_count": "count rows"}
+        plan = _make_plan("row_count")
+        mock_hook = _make_llm_hook(plan)
+
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+
+        with caplog.at_level("INFO"):
+            planner.generate_plan(prompts, schema_context="Table: orders\nColumns: id INT")
+
+        assert "Generating DQ plan with" in caplog.text
+        assert "Using system prompt:" not in caplog.text
+        assert "Using user message:" not in caplog.text
+
+        caplog.clear()
+        with caplog.at_level("DEBUG"):
+            planner.generate_plan(prompts, schema_context="Table: orders\nColumns: id INT")
+
+        assert "Using system prompt:" in caplog.text
+        assert "Using user message:" in caplog.text
 
 
 class TestSQLDQPlannerExecutePlan:
@@ -1442,3 +1463,58 @@ class TestIterDataFusionRowChunks:
         planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
         rows = list(planner._iter_datafusion_row_chunks(mock_engine, "SELECT 1"))
         assert rows == []
+
+
+class TestExtractTableNames:
+    def test_single_table(self):
+        schema = "Table: orders\nColumns: id INT, amount DOUBLE"
+        assert _extract_table_names(schema) == ["orders"]
+
+    def test_multiple_tables(self):
+        schema = (
+            "Table: orders\nColumns: id INT, amount DOUBLE\n\nTable: customers\nColumns: id INT, name VARCHAR"
+        )
+        assert _extract_table_names(schema) == ["orders", "customers"]
+
+    def test_empty_string(self):
+        assert _extract_table_names("") == []
+
+    def test_no_table_prefix(self):
+        assert _extract_table_names("Columns: id INT") == []
+
+
+class TestTableNameConstraintInPrompt:
+    def test_constraint_included_when_schema_has_tables(self):
+        prompts = {"row_count": "count rows"}
+        plan = _make_plan("row_count")
+        mock_hook = _make_llm_hook(plan)
+
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+        planner.generate_plan(prompts, schema_context="Table: sales_data\nColumns: id INT")
+
+        instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
+        assert "TABLE NAME CONSTRAINT" in instructions
+        assert "sales_data" in instructions
+
+    def test_constraint_not_included_when_schema_empty(self):
+        prompts = {"row_count": "count rows"}
+        plan = _make_plan("row_count")
+        mock_hook = _make_llm_hook(plan)
+
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+        planner.generate_plan(prompts, schema_context="")
+
+        instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
+        assert "TABLE NAME CONSTRAINT" not in instructions
+
+    def test_constraint_lists_multiple_tables(self):
+        prompts = {"row_count": "count rows"}
+        plan = _make_plan("row_count")
+        mock_hook = _make_llm_hook(plan)
+
+        schema = "Table: orders\nColumns: id INT\n\nTable: customers\nColumns: id INT"
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
+        planner.generate_plan(prompts, schema_context=schema)
+
+        instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
+        assert "orders, customers" in instructions

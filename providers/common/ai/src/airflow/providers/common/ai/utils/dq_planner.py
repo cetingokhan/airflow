@@ -25,7 +25,9 @@ touching the operator.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import closing
 from typing import TYPE_CHECKING, Any
@@ -191,6 +193,19 @@ ROW-LEVEL CHECKS:
   Row-level check names that require this treatment: {row_level_check_names}
 """
 
+_TABLE_NAME_CONSTRAINT_SECTION = """
+TABLE NAME CONSTRAINT:
+  The ONLY table(s) you may reference in FROM clauses are: {table_names}.
+  You MUST use these exact table names in every SQL query you generate.
+  Do NOT rename, abbreviate, alias the table, or invent new table names.
+  Using any table name not listed above will cause a runtime error.
+"""
+
+
+def _extract_table_names(schema_context: str) -> list[str]:
+    """Extract table names from a schema context string produced by :func:`build_schema_context`."""
+    return re.findall(r"^Table:\s+(\S+)", schema_context, re.MULTILINE)
+
 
 class SQLDQPlanner:
     """
@@ -302,6 +317,9 @@ class SQLDQPlanner:
 
         if schema_context:
             system_prompt += f"\nAvailable schema:\n{schema_context}\n"
+            table_names = _extract_table_names(schema_context)
+            if table_names:
+                system_prompt += _TABLE_NAME_CONSTRAINT_SECTION.format(table_names=", ".join(table_names))
 
         if self._validator_contexts:
             system_prompt += self._validator_contexts
@@ -321,9 +339,18 @@ class SQLDQPlanner:
             system_prompt += f"\nAdditional instructions:\n{self._extra_system_prompt}\n"
 
         user_message = self._build_user_message(prompts)
+        prompt_fingerprint = hashlib.sha256(f"{system_prompt}\n{user_message}".encode()).hexdigest()[:12]
 
-        log.info("Using system prompt:\n%s", system_prompt)
-        log.info("Using user message:\n%s", user_message)
+        log.info(
+            "Generating DQ plan with %d prompt(s) (system_prompt_chars=%d, user_message_chars=%d, "
+            "prompt_fingerprint=%s).",
+            len(prompts),
+            len(system_prompt),
+            len(user_message),
+            prompt_fingerprint,
+        )
+        log.debug("Using system prompt:\n%s", system_prompt)
+        log.debug("Using user message:\n%s", user_message)
 
         agent = self._llm_hook.create_agent(
             output_type=DQPlan, instructions=system_prompt, **self._agent_params

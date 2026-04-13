@@ -1076,3 +1076,21 @@ class TestLLMDataQualityOperatorMissingMaxInvalidPct:
         # Deliberately no _max_invalid_pct attribute
         with pytest.raises(AirflowException):
             self._run_row_level(0.01, validator)
+
+    def test_string_threshold_is_coerced_to_float(self):
+        """String numeric _max_invalid_pct should be accepted and coerced to float."""
+        validator = lambda v: v is not None
+        validator._row_level = True
+        validator._max_invalid_pct = "0.05"
+
+        result = self._run_row_level(0.01, validator)
+        assert result["passed"] is True
+
+    def test_invalid_threshold_raises_clear_value_error(self):
+        """Non-numeric _max_invalid_pct should raise a clear ValueError with check context."""
+        validator = lambda v: v is not None
+        validator._row_level = True
+        validator._max_invalid_pct = "not-a-number"
+
+        with pytest.raises(ValueError, match="email_valid"):
+            self._run_row_level(0.01, validator)

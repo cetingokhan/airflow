@@ -436,7 +436,16 @@ class LLMDataQualityOperator(LLMOperator):
         ]
         for check in group.checks:
             validator = self.validators.get(check.check_name)
-            max_pct = getattr(validator, "_max_invalid_pct", None)
+            max_pct = (
+                self._resolve_row_level_max_invalid_pct(
+                    check.check_name,
+                    validator,
+                    default_when_missing=None,
+                    warn_on_missing=False,
+                )
+                if validator is not None
+                else None
+            )
             threshold_str = f"{max_pct:.2%}" if max_pct is not None else "—"
             lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {threshold_str} |")
 
@@ -481,6 +490,33 @@ class LLMDataQualityOperator(LLMOperator):
         plan.plan_hash = plan_hash
         Variable.set(variable_key, plan.model_dump_json())
         return plan
+
+    def _resolve_row_level_max_invalid_pct(
+        self,
+        check_name: str,
+        validator: Callable[[Any], bool],
+        *,
+        default_when_missing: float | None,
+        warn_on_missing: bool,
+    ) -> float | None:
+        """Return row-level threshold as ``float`` or raise a clear ``ValueError``."""
+        if not hasattr(validator, "_max_invalid_pct"):
+            if warn_on_missing:
+                self.log.warning(
+                    "Row-level validator for check %r has no '_max_invalid_pct' attribute — "
+                    "defaulting threshold to 0.0%%. Every invalid row will fail the check.",
+                    check_name,
+                )
+            return default_when_missing
+
+        raw_max_pct = getattr(validator, "_max_invalid_pct")
+        try:
+            return float(raw_max_pct)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Row-level validator for check {check_name!r} has invalid _max_invalid_pct "
+                f"value {raw_max_pct!r}; expected a numeric value."
+            ) from exc
 
     def _validate_results(
         self,
@@ -537,14 +573,13 @@ class LLMDataQualityOperator(LLMOperator):
                             "but none was provided."
                         )
                     else:
-                        if not hasattr(validator, "_max_invalid_pct"):
-                            self.log.warning(
-                                "Row-level validator for check %r has no '_max_invalid_pct' attribute — "
-                                "defaulting threshold to 0.0%%. Every invalid row will fail the check.",
-                                check.check_name,
-                            )
-                        max_pct = getattr(validator, "_max_invalid_pct", 0.0)
-                        passed = value.invalid_pct <= max_pct
+                        max_pct = self._resolve_row_level_max_invalid_pct(
+                            check.check_name,
+                            validator,
+                            default_when_missing=0.0,
+                            warn_on_missing=True,
+                        )
+                        passed = value.invalid_pct <= (max_pct if max_pct is not None else 0.0)
                         if not passed:
                             failure_reason = (
                                 f"Row-level check failed: {value.invalid}/{value.total} rows invalid "
