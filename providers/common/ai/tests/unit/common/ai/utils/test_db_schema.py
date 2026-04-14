@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from airflow.providers.common.ai.utils.db_schema import build_schema_context
+from airflow.providers.common.sql.hooks.sql import DbApiHook
 
 
 class TestBuildSchemaContext:
@@ -34,11 +35,13 @@ class TestBuildSchemaContext:
             )
 
     def test_uses_bulk_schema_fetch_when_available(self):
-        mock_db_hook = MagicMock()
-        mock_db_hook.get_table_schemas.return_value = {
-            "customers": [{"name": "id", "type": "INT"}],
-            "orders": [{"name": "order_id", "type": "INT"}],
-        }
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_table_schemas = MagicMock(
+            return_value={
+                "customers": [{"name": "id", "type": "INT"}],
+                "orders": [{"name": "order_id", "type": "INT"}],
+            }
+        )
 
         result = build_schema_context(
             db_hook=mock_db_hook,
@@ -53,10 +56,10 @@ class TestBuildSchemaContext:
         assert "Table: orders" in result
 
     def test_falls_back_to_single_table_schema_when_bulk_result_missing_table(self):
-        mock_db_hook = MagicMock()
-        mock_db_hook.get_table_schemas.return_value = {
-            "customers": [{"name": "id", "type": "INT"}],
-        }
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_table_schemas = MagicMock(
+            return_value={"customers": [{"name": "id", "type": "INT"}]}
+        )
         mock_db_hook.get_table_schema.return_value = [{"name": "order_id", "type": "INT"}]
 
         result = build_schema_context(
