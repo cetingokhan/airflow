@@ -126,9 +126,6 @@ def _introspect_schemas(
     parts: list[str] = []
     table_to_columns: dict[str, list[dict[str, str]]] = {}
 
-    if table_names and db_hook is None:
-        raise ValueError("table_names requires db_conn_id so table schema can be introspected.")
-
     if db_hook and table_names:
         bulk_schemas = _try_to_get_bulk_table_schemas(db_hook=db_hook, table_names=table_names)
         if bulk_schemas is not None:

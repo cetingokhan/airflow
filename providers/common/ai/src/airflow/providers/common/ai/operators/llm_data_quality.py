@@ -191,6 +191,11 @@ class LLMDataQualityOperator(LLMOperator):
 
         self._validate_checks()
 
+        if table_names and db_conn_id is None and datasource_config is None:
+            raise ValueError(
+                "table_names requires db_conn_id (or datasource_config) so table schema can be introspected."
+            )
+
     def execute(self, context: Context) -> dict[str, Any]:
         """
         Generate the DQ plan (or load from cache), then execute or defer for approval.
