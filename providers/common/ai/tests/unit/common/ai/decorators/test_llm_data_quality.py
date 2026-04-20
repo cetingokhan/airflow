@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,16 +24,17 @@ import pytest
 from airflow.providers.common.ai.decorators.llm_data_quality import (
     _LLMDQDecoratedOperator,
 )
-from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan
+from airflow.providers.common.ai.hooks.pydantic_ai import PydanticAIHook
+from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQCheckInput, DQPlan
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_PROMPTS = {
-    "null_emails": "Check for null email addresses",
-    "dup_ids": "Check for duplicate customer IDs",
-}
+_CHECKS = [
+    DQCheckInput(name="null_emails", description="Check for null email addresses"),
+    DQCheckInput(name="dup_ids", description="Check for duplicate customer IDs"),
+]
 
 
 def _make_plan() -> DQPlan:
@@ -71,7 +73,7 @@ def _make_op(callable_fn=None, **kwargs) -> _LLMDQDecoratedOperator:
     if callable_fn is None:
 
         def callable_fn():
-            return _PROMPTS
+            return _CHECKS
 
     return _LLMDQDecoratedOperator(
         task_id="test_dq",
@@ -82,7 +84,9 @@ def _make_op(callable_fn=None, **kwargs) -> _LLMDQDecoratedOperator:
     )
 
 
-def _run_op(callable_fn, plan, results_map, **op_kwargs) -> dict:
+@contextmanager
+def _patched_runtime(*, plan: DQPlan, results_map: dict, cache_value: str | None = None):
+    """Patch runtime collaborators and yield planner/variable mocks."""
     with (
         patch("airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True) as mock_var,
         patch(
@@ -94,14 +98,18 @@ def _run_op(callable_fn, plan, results_map, **op_kwargs) -> dict:
             autospec=True,
         ),
     ):
-        mock_var.get.return_value = None
+        mock_var.get.return_value = cache_value
         mock_planner = mock_planner_cls.return_value
         mock_planner.build_schema_context.return_value = ""
         mock_planner.generate_plan.return_value = plan
         mock_planner.execute_plan.return_value = results_map
+        yield mock_var, mock_planner_cls, mock_planner
 
+
+def _run_op(callable_fn, plan, results_map, **op_kwargs) -> dict:
+    with _patched_runtime(plan=plan, results_map=results_map):
         op = _make_op(callable_fn, **op_kwargs)
-        op.llm_hook = MagicMock()
+        op.llm_hook = MagicMock(spec=PydanticAIHook)
         return op.execute(context={})
 
 
@@ -109,85 +117,56 @@ class TestLLMDQDecoratedOperator:
     def test_custom_operator_name(self):
         assert _LLMDQDecoratedOperator.custom_operator_name == "@task.llm_dq"
 
-    def test_validators_with_unknown_key_accepted_at_init(self):
-        """Validator key validation is deferred to execute time when prompts is SET_DURING_EXECUTION."""
-        op = _make_op(validators={"unknown_check": lambda v: v == 0})
-        # No error at init time because prompts is SET_DURING_EXECUTION
-        assert "unknown_check" in op.validators
-
-    def test_callable_return_value_becomes_prompts(self):
-        """The dict returned by the callable is used as prompts for plan generation."""
+    def test_callable_return_value_becomes_checks(self):
+        """The list returned by the callable is assigned to op.checks."""
         plan = _make_plan()
         results_map = {"null_emails": 0, "dup_ids": 0}
 
         def my_checks():
-            return _PROMPTS
+            return _CHECKS
 
-        with (
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
-            ) as mock_var,
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner",
-                autospec=True,
-            ) as mock_planner_cls,
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.get_db_hook",
-                autospec=True,
-            ),
-        ):
-            mock_var.get.return_value = None
-            mock_planner = mock_planner_cls.return_value
-            mock_planner.build_schema_context.return_value = ""
-            mock_planner.generate_plan.return_value = plan
-            mock_planner.execute_plan.return_value = results_map
-
+        with _patched_runtime(plan=plan, results_map=results_map):
             op = _make_op(my_checks)
-            op.llm_hook = MagicMock()
+            op.llm_hook = MagicMock(spec=PydanticAIHook)
             op.execute(context={})
 
-            assert op.prompts == _PROMPTS
+            assert op.checks == _CHECKS
 
     def test_happy_path_all_checks_pass(self):
+        checks_with_validators = [
+            DQCheckInput(
+                name="null_emails", description="Check for null email addresses", validator=lambda v: v == 0
+            ),
+            DQCheckInput(
+                name="dup_ids", description="Check for duplicate customer IDs", validator=lambda v: v == 0
+            ),
+        ]
         plan = _make_plan()
         result = _run_op(
-            lambda: _PROMPTS,
+            lambda: checks_with_validators,
             plan,
             {"null_emails": 0, "dup_ids": 0},
-            validators={
-                "null_emails": lambda v: v == 0,
-                "dup_ids": lambda v: v == 0,
-            },
         )
         assert result["passed"] is True
 
-    def test_raises_on_invalid_prompts_return_value(self):
-        """TypeError when the callable returns a non-dict or empty value."""
-        op = _make_op(lambda: "not a dict")
-        with pytest.raises(TypeError, match="non-empty dict"):
+    def test_raises_on_invalid_return_value(self):
+        """TypeError when the callable returns a non-list or empty value."""
+        op = _make_op(lambda: "not a list")
+        with pytest.raises(TypeError, match="non-empty list"):
             op.execute(context={})
 
     @pytest.mark.parametrize(
         "return_value",
-        [{}, None, 42, ""],
-        ids=["empty-dict", "none", "int", "empty-string"],
+        [[], None, 42, ""],
+        ids=["empty-list", "none", "int", "empty-string"],
     )
-    def test_raises_on_falsy_prompts(self, return_value):
+    def test_raises_on_falsy_return(self, return_value):
         op = _make_op(lambda: return_value)
-        with pytest.raises(TypeError, match="non-empty dict"):
-            op.execute(context={})
-
-    def test_validator_key_not_in_prompts_raises_at_execute(self):
-        """ValueError is raised at execute time when a validator key is not in the returned prompts."""
-        op = _make_op(
-            lambda: {"null_emails": "Check nulls"},
-            validators={"unknown_check": lambda v: v == 0},
-        )
-        with pytest.raises(ValueError, match="unknown_check"):
+        with pytest.raises(TypeError, match="non-empty list"):
             op.execute(context={})
 
     def test_merges_op_kwargs_into_callable(self):
-        """op_kwargs are passed to the callable when building the prompts dict."""
+        """op_kwargs are passed to the callable when building the checks list."""
         results_map = {"row_count": 5000}
         single_check_plan = DQPlan(
             groups=[
@@ -200,39 +179,26 @@ class TestLLMDQDecoratedOperator:
         )
 
         def my_checks(min_rows):
-            return {"row_count": f"Orders must have at least {min_rows} rows."}
+            return [
+                DQCheckInput(
+                    name="row_count",
+                    description=f"Orders must have at least {min_rows} rows.",
+                ),
+            ]
 
-        with (
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.Variable", autospec=True
-            ) as mock_var,
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.SQLDQPlanner",
-                autospec=True,
-            ) as mock_planner_cls,
-            patch(
-                "airflow.providers.common.ai.operators.llm_data_quality.get_db_hook",
-                autospec=True,
-            ),
-        ):
-            mock_var.get.return_value = None
-            mock_planner = mock_planner_cls.return_value
-            mock_planner.build_schema_context.return_value = ""
-            mock_planner.generate_plan.return_value = single_check_plan
-            mock_planner.execute_plan.return_value = results_map
-
+        with _patched_runtime(plan=single_check_plan, results_map=results_map):
             op = _make_op(
                 my_checks,
                 op_kwargs={"min_rows": 1000},
             )
-            op.llm_hook = MagicMock()
+            op.llm_hook = MagicMock(spec=PydanticAIHook)
             op.execute(context={"task_instance": MagicMock()})
-            assert "1000" in op.prompts["row_count"]
+            assert "1000" in op.checks[0].description
 
     def test_dry_run_returns_plan_dict(self):
         """dry_run=True returns a unified dict with plan, passed=None, results=None."""
         plan = _make_plan()
-        result = _run_op(lambda: _PROMPTS, plan, {}, dry_run=True)
+        result = _run_op(lambda: _CHECKS, plan, {}, dry_run=True)
         assert isinstance(result, dict)
         assert result["passed"] is None
         assert result["results"] is None

@@ -19,10 +19,12 @@ Pydantic models for the LLM data quality plan and result reporting.
 
 ``DQPlan`` is the structured output type requested from the LLM.  The remaining
 dataclasses hold execution results and are never serialised back to the model.
+``DQCheckInput`` represents a single user-supplied check definition for the operator.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,11 +33,81 @@ from pydantic import BaseModel, Field, computed_field
 from airflow.providers.common.compat.sdk import AirflowException
 
 
+class DQCheckInput:
+    """
+    A single user-supplied data-quality check definition.
+
+    The LLM selects the appropriate validator automatically from the registry;
+    supply *validator* only when you want to force a specific callable and bypass
+    the LLM suggestion entirely.
+
+    :param name: Unique check identifier.  Used as ``check_name`` throughout the
+        plan and results.
+    :param description: Natural-language description of the expectation.  This is
+        what the LLM reads to produce the SQL and select a validator.
+    :param validator: Optional fixed validator callable.  When provided the LLM is
+        **not** asked to suggest a validator for this check; the supplied callable is
+        used directly.  Accepts plain lambdas or any factory-produced callable from
+        :mod:`~airflow.providers.common.ai.utils.dq_validation`.
+    """
+
+    # Allow Airflow's template engine to render Jinja expressions inside
+    # ``name`` and ``description`` when the operator renders template_fields.
+    template_fields: tuple[str, ...] = ("name", "description")
+
+    __slots__ = ("description", "name", "validator")
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: str,
+        validator: Callable[[Any], bool] | None = None,
+    ) -> None:
+        if not name or not name.strip():
+            raise ValueError("DQCheckInput.name must not be empty.")
+        if not description or not description.strip():
+            raise ValueError("DQCheckInput.description must not be empty.")
+        self.name = name
+        self.description = description
+        self.validator = validator
+
+    @classmethod
+    def coerce(cls, value: Any) -> DQCheckInput:
+        """
+        Accept a :class:`DQCheckInput` instance or a plain dict and return a :class:`DQCheckInput`.
+
+        Plain dicts must contain ``name`` and ``description`` keys; ``validator`` is
+        optional.
+
+        :raises TypeError: If *value* is neither a :class:`DQCheckInput` nor a ``dict``.
+        :raises KeyError: If *value* is a dict missing required keys.
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                name=value["name"],
+                description=value["description"],
+                validator=value.get("validator"),
+            )
+        raise TypeError(
+            f"Expected DQCheckInput or dict, got {type(value).__name__!r}. "
+            "Each check must have 'name' and 'description' fields."
+        )
+
+    def __repr__(self) -> str:
+        has_validator = self.validator is not None
+        return (
+            f"DQCheckInput(name={self.name!r}, description={self.description!r}, validator={has_validator})"
+        )
+
+
 class DQCheck(BaseModel):
     """
     A single data-quality check produced by the LLM.
 
-    :param check_name: Matches the key supplied by the user in ``prompts``.
+    :param check_name: Matches the ``name`` supplied by the user in ``checks``.
     :param metric_key: Column alias used in the generated SQL (e.g. ``null_email_count``).
         The operator reads ``row[metric_key]`` from the query result.
     :param group_id: Logical bucket for grouping checks into a single SQL query
@@ -50,9 +122,15 @@ class DQCheck(BaseModel):
         validity / regex / format checks when ``collect_unexpected`` is enabled.
         Pure aggregate checks (null percentage, row count, duplicates) leave
         this as ``None``.
+    :param validator_name: Registered validator name chosen by the LLM from the
+        available registry.  ``None`` or ``"none"`` when the check has a user-fixed
+        validator or when no suitable validator was found.
+    :param validator_args: Keyword arguments that the LLM suggests passing to the
+        validator factory (e.g. ``{"max_pct": 0.05}``).  Empty dict when no
+        validator was selected.
     """
 
-    check_name: str = Field(description="Matches the key supplied by the user in prompts.")
+    check_name: str = Field(description="Matches the check name supplied by the user in the checks list.")
     metric_key: str = Field(
         description="Column alias used in the generated SQL (e.g. null_email_count). The operator reads row[metric_key] from the query result."
     )
@@ -83,6 +161,21 @@ class DQCheck(BaseModel):
             "and aggregates the results into a RowLevelResult."
         ),
     )
+    validator_name: str | None = Field(
+        default=None,
+        description=(
+            "Registered validator name chosen by the LLM from the available registry. "
+            "Set to null when the check has a user-fixed validator or set to 'none' when "
+            "no suitable validator was found."
+        ),
+    )
+    validator_args: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Keyword arguments to pass to the validator factory "
+            '(e.g. {"max_pct": 0.05}). Empty dict when no validator was selected.'
+        ),
+    )
 
 
 class DQCheckGroup(BaseModel):
@@ -109,17 +202,17 @@ class DQPlan(BaseModel):
     Complete data-quality execution plan returned by the LLM.
 
     :param groups: All SQL check groups.  Together, the checks inside every group
-        must cover every key in the user's ``prompts`` dict exactly once.
-    :param plan_hash: SHA-256 fingerprint of the prompt dict (set by the operator
+        must cover every check name in the user's ``checks`` list exactly once.
+    :param plan_hash: SHA-256 fingerprint of the checks list (set by the operator
         after generation — not populated by the LLM).
     """
 
     groups: list[DQCheckGroup] = Field(
-        description="All SQL check groups. Together, the checks inside every group must cover every key in the user's prompts dict exactly once."
+        description="All SQL check groups. Together, the checks inside every group must cover every check name in the user's checks list exactly once."
     )
     plan_hash: str = Field(
         default="",
-        description="SHA-256 fingerprint of the prompt dict (set by the operator after generation — not populated by the LLM).",
+        description="SHA-256 fingerprint of the checks list (set by the operator after generation — not populated by the LLM).",
     )
 
     @computed_field  # type: ignore[prop-decorator]
@@ -138,7 +231,7 @@ class RowLevelResult:
     :meth:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._execute_row_level_group`
     when a :class:`DQCheck` has ``row_level=True``.
 
-    :param check_name: Corresponds to the user prompt key.
+    :param check_name: Corresponds to the user-supplied check name.
     :param total: Total number of rows evaluated.
     :param invalid: Number of rows for which the validator returned ``False``.
     :param invalid_pct: Fraction of invalid rows (``invalid / total``), or ``0.0``
@@ -155,6 +248,16 @@ class RowLevelResult:
     invalid_pct: float
     sample_violations: list[str]
     sample_size: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable dict of result metrics (excludes ``check_name``)."""
+        return {
+            "total": self.total,
+            "invalid": self.invalid,
+            "invalid_pct": self.invalid_pct,
+            "sample_violations": self.sample_violations,
+            "sample_size": self.sample_size,
+        }
 
 
 @dataclass

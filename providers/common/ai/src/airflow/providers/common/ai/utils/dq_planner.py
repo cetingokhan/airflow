@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import closing
 from typing import TYPE_CHECKING, Any
@@ -44,7 +45,14 @@ except ImportError as e:
     raise AirflowOptionalProviderFeatureException(e)
 
 from airflow.providers.common.ai.utils.db_schema import build_schema_context, resolve_dialect
-from airflow.providers.common.ai.utils.dq_models import DQCheckGroup, DQPlan, RowLevelResult, UnexpectedResult
+from airflow.providers.common.ai.utils.dq_models import (
+    DQCheckGroup,
+    DQCheckInput,
+    DQPlan,
+    RowLevelResult,
+    UnexpectedResult,
+)
+from airflow.providers.common.ai.utils.dq_validation import DQValidationToolset
 from airflow.providers.common.ai.utils.logging import log_run_summary
 
 if TYPE_CHECKING:
@@ -120,7 +128,7 @@ GROUPING STRATEGY (multi-dimensional):
 OUTPUT RULES:
   1. Each output column must be aliased to exactly the metric_key of its check.
      Example: ... AS null_email_pct
-  2. Each check_name must exactly match the key in the prompts dict.
+  2. Each check_name must exactly match the name in the provided checks list.
   3. metric_key values must be valid SQL column aliases (snake_case, no spaces).
   4. Generates only SELECT queries — no INSERT, UPDATE, DELETE, DROP, or DDL.
   5. Use {dialect} syntax.
@@ -228,6 +236,14 @@ class SQLDQPlanner:
     :param row_level_sample_size: Maximum number of rows to fetch for row-level
         checks.  ``None`` (default) performs a full scan.  A positive integer
         instructs the LLM to add ``LIMIT N`` to the generated SELECT.
+    :param toolset: :class:`~airflow.providers.common.ai.utils.dq_validation.DQValidationToolset`
+        that exposes the validator catalog to the LLM and validates its selections.
+        Defaults to a toolset backed by the :data:`~airflow.providers.common.ai.utils.dq_validation.default_registry`.
+    :param fixed_validators: Mapping of ``{check_name: callable}`` for checks where
+        the user preselected a validator.  These checks are excluded from LLM
+        validator-suggestion and the provided callables are used directly.
+    :param max_validator_retries: Maximum number of times the LLM is asked to correct
+        invalid validator selections before the plan is rejected.  Default ``3``.
     """
 
     def __init__(
@@ -245,6 +261,9 @@ class SQLDQPlanner:
         validator_contexts: str = "",
         row_validators: dict[str, Any] | None = None,
         row_level_sample_size: int | None = None,
+        toolset: DQValidationToolset | None = None,
+        fixed_validators: dict[str, Any] | None = None,
+        max_validator_retries: int = 3,
     ) -> None:
         self._llm_hook = llm_hook
         self._db_hook = db_hook
@@ -266,6 +285,9 @@ class SQLDQPlanner:
         self._validator_contexts = validator_contexts
         self._row_validators: dict[str, Any] = row_validators or {}
         self._row_level_sample_size = row_level_sample_size
+        self._toolset: DQValidationToolset = toolset if toolset is not None else DQValidationToolset()
+        self._fixed_validators: dict[str, Any] = fixed_validators or {}
+        self._max_validator_retries = max_validator_retries
         self._cached_datafusion_engine: DataFusionEngine | None = None
         self._plan_agent: Agent[None, DQPlan] | None = None
         self._plan_all_messages: list[ModelMessage] | None = None
@@ -287,21 +309,43 @@ class SQLDQPlanner:
             datasource_config=self._datasource_config,
         )
 
-    def generate_plan(self, prompts: dict[str, str], schema_context: str) -> DQPlan:
+    def build_catalog_hash(self) -> str:
+        """
+        Return a 16-char SHA-256 fingerprint of the current validator catalog.
+
+        Used by the operator to include a catalog change fingerprint in the plan
+        cache key, ensuring that adding or removing a validator invalidates stale
+        cached plans without requiring a new ``prompt_version``.
+        """
+        section = self._toolset.build_system_prompt_section()
+        return hashlib.sha256(section.encode()).hexdigest()[:16]
+
+    def generate_plan(self, checks: list[DQCheckInput], schema_context: str) -> DQPlan:
         """
         Ask the LLM to produce a :class:`~airflow.providers.common.ai.utils.dq_models.DQPlan`.
 
-        The LLM receives the user prompts, schema context, and planning instructions
-        as a structured-output call (``output_type=DQPlan``).  After generation the
-        method verifies that the returned ``check_names`` exactly match
-        ``prompts.keys()``.
+        The LLM receives the check definitions, schema context, validator catalog,
+        and planning instructions as a structured-output call (``output_type=DQPlan``).
+        In a single response the model produces both the SQL plan and validator
+        selections for each check.
 
-        :param prompts: ``{check_name: natural_language_description}`` dict.
+        After generation the method:
+
+        1. Verifies that the returned ``check_names`` exactly match the input names.
+        2. Validates each LLM-suggested validator via the toolset.
+        3. On validation failures, retries up to ``max_validator_retries`` times by
+           continuing the same conversation thread.
+        4. Instantiates validated validator suggestions and merges them with any
+           user-fixed validators.
+
+        :param checks: A list of :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput`
+            objects describing the data-quality expectations.
         :param schema_context: Schema description previously built via
             :meth:`build_schema_context`.
-        :raises ValueError: If the LLM's plan does not cover every prompt key
-            exactly once.
+        :raises ValueError: If the LLM's plan does not cover every check name exactly once.
+        :raises ValueError: If validator suggestions cannot be corrected within the retry budget.
         """
+        check_descriptions = {c.name: c.description for c in checks}
         dialect_label = self._dialect or ("DataFusion-compatible SQL" if self._is_datafusion else "SQL")
         system_prompt = _PLANNING_SYSTEM_PROMPT.format(
             dialect=dialect_label, max_checks_per_group=_MAX_CHECKS_PER_GROUP
@@ -321,6 +365,10 @@ class SQLDQPlanner:
             if table_names:
                 system_prompt += _TABLE_NAME_CONSTRAINT_SECTION.format(table_names=", ".join(table_names))
 
+        # Inject validator catalog for LLM-driven selection.
+        system_prompt += self._toolset.build_system_prompt_section()
+
+        # Legacy per-validator context (still injected for fixed validators that carry it).
         if self._validator_contexts:
             system_prompt += self._validator_contexts
 
@@ -338,13 +386,13 @@ class SQLDQPlanner:
         if self._extra_system_prompt:
             system_prompt += f"\nAdditional instructions:\n{self._extra_system_prompt}\n"
 
-        user_message = self._build_user_message(prompts)
+        user_message = self._build_user_message(checks, fixed_validator_names=set(self._fixed_validators))
         prompt_fingerprint = hashlib.sha256(f"{system_prompt}\n{user_message}".encode()).hexdigest()[:12]
 
         log.info(
-            "Generating DQ plan with %d prompt(s) (system_prompt_chars=%d, user_message_chars=%d, "
+            "Generating DQ plan with %d check(s) (system_prompt_chars=%d, user_message_chars=%d, "
             "prompt_fingerprint=%s).",
-            len(prompts),
+            len(checks),
             len(system_prompt),
             len(user_message),
             prompt_fingerprint,
@@ -358,16 +406,129 @@ class SQLDQPlanner:
         result = agent.run_sync(user_message)
         log_run_summary(log, result)
 
-        # Persist the agent and full conversation so execute_plan can continue
-        # the same chat thread when asking for SQL corrections.
+        # Persist the agent and full conversation so execute_plan and validator
+        # correction can continue the same chat thread.
         self._plan_agent = agent
         self._plan_all_messages = result.all_messages()
 
         plan: DQPlan = result.output
 
-        self._validate_plan_coverage(plan, prompts)
+        self._validate_plan_coverage(plan, check_descriptions)
         self._validate_group_sizes(plan)
+
+        # Validate and potentially retry LLM validator suggestions.
+        plan = self._validate_and_fix_validator_suggestions(plan)
+
         return plan
+
+    def _validate_and_fix_validator_suggestions(self, plan: DQPlan) -> DQPlan:
+        """
+        Validate LLM-suggested validator names and arguments for each check.
+
+        Checks with a user-fixed validator (in ``self._fixed_validators``) are
+        skipped.  For the rest, each suggestion is tested via
+        :meth:`~airflow.providers.common.ai.utils.dq_validation.DQValidationToolset.validate_suggestion`.
+
+        On failure the LLM is sent a correction prompt in the same conversation
+        thread (up to ``max_validator_retries`` attempts).  If the LLM still
+        returns invalid selections after all retries, an informative
+        :class:`ValueError` is raised.
+
+        :param plan: Plan returned by the initial LLM call.
+        :returns: The plan with validated (and possibly corrected) validator fields.
+        :raises ValueError: If validator suggestions cannot be corrected.
+        """
+        current_plan = plan
+        for attempt in range(1, self._max_validator_retries + 1):
+            errors = self._collect_validator_errors(current_plan)
+            if not errors:
+                break
+
+            # Log all failed checks as errors so they are visible in task logs.
+            for check_name, error_msg in errors.items():
+                log.error(
+                    "Validator suggestion invalid for check %r (attempt %d/%d): %s",
+                    check_name,
+                    attempt,
+                    self._max_validator_retries,
+                    error_msg,
+                )
+
+            if self._plan_agent is None or self._plan_all_messages is None:
+                # No conversation thread to continue — fail immediately.
+                break
+
+            correction_prompt = self._build_validator_correction_prompt(errors)
+            log.info(
+                "Sending validator correction prompt (attempt %d/%d).",
+                attempt,
+                self._max_validator_retries,
+            )
+            result = self._plan_agent.run_sync(
+                correction_prompt,
+                message_history=self._plan_all_messages,
+            )
+            self._plan_all_messages = result.all_messages()
+            current_plan = result.output
+
+        # Final check after loop.
+        errors = self._collect_validator_errors(current_plan)
+        if errors:
+            error_lines = [f"  - {name}: {msg}" for name, msg in sorted(errors.items())]
+            raise ValueError(
+                f"LLM validator suggestions could not be corrected after "
+                f"{self._max_validator_retries} attempt(s). "
+                f"Invalid suggestions:\n" + "\n".join(error_lines)
+            )
+
+        return current_plan
+
+    def _collect_validator_errors(self, plan: DQPlan) -> dict[str, str]:
+        """
+        Return a ``{check_name: error_message}`` dict for every invalid validator suggestion.
+
+        Checks with user-fixed validators are excluded from validation.
+        """
+        errors: dict[str, str] = {}
+        for group in plan.groups:
+            for check in group.checks:
+                if check.check_name in self._fixed_validators:
+                    continue
+                # For non-fixed checks, missing validator_name is invalid and must
+                # trigger correction/failure.
+                suggested_name = check.validator_name or ""
+                ok, msg = self._toolset.validate_suggestion(
+                    check.check_name,
+                    suggested_name,
+                    check.validator_args,
+                )
+                if not ok:
+                    errors[check.check_name] = msg
+        return errors
+
+    def set_row_validators(self, row_validators: dict[str, Any]) -> None:
+        """Replace runtime row-level validators used by :meth:`execute_plan`."""
+        self._row_validators = dict(row_validators)
+
+    @staticmethod
+    def _build_validator_correction_prompt(errors: dict[str, str]) -> str:
+        """Build the follow-up message asking the LLM to fix invalid validator selections."""
+        lines = [
+            "The following validator selections from your previous response are invalid.",
+            "Please produce a corrected DQPlan with valid validator_name and validator_args "
+            "for each of the checks listed below.  You MUST choose names and argument keys "
+            "exactly as listed in the AVAILABLE VALIDATORS section.",
+            "",
+            "Errors to fix:",
+        ]
+        for check_name, error_msg in sorted(errors.items()):
+            lines.append(f'  - check_name="{check_name}": {error_msg}')
+        lines += [
+            "",
+            "Return a complete DQPlan (not just the corrected checks) with all SQL and "
+            "validator fields filled in.",
+        ]
+        return "\n".join(lines)
 
     def execute_plan(self, plan: DQPlan) -> dict[str, Any]:
         """
@@ -418,6 +579,8 @@ class SQLDQPlanner:
                 row = self._run_datafusion_group(datafusion_engine, group)
             else:
                 row = self._run_db_group(group)
+
+            self._validate_result_column_order(group, list(row.keys()))
 
             for check in group.checks:
                 if check.metric_key not in row:
@@ -587,8 +750,8 @@ class SQLDQPlanner:
                     f"DataFusion batch has inconsistent column lengths: {col_lengths}. "
                     "Arrow RecordBatch columns must all have the same length."
                 )
-            n = next(iter(unique_lengths))
-            yield [{col: col_dict[col][i] for col in col_names} for i in range(n)]
+            columns = [col_dict[col] for col in col_names]
+            yield [dict(zip(col_names, row_values, strict=True)) for row_values in zip(*columns, strict=True)]
 
     def _build_datafusion_engine(self) -> DataFusionEngine:
         """
@@ -660,6 +823,22 @@ class SQLDQPlanner:
             f"Unsupported row type from DbApiHook.get_records for group {group.group_id!r}: "
             f"{type(raw_row).__name__}. Expected dict or sequence."
         )
+
+    @staticmethod
+    def _validate_result_column_order(group: DQCheckGroup, returned_columns: list[str]) -> None:
+        """
+        Ensure query result column order matches the order of checks in the plan group.
+
+        SQL output columns are expected to align positionally with ``group.checks``.
+        """
+        if not returned_columns:
+            return
+        expected_order = [check.metric_key for check in group.checks]
+        if returned_columns != expected_order:
+            raise ValueError(
+                f"Query for group {group.group_id!r} returned columns in unexpected order. "
+                f"Expected {expected_order}, got {returned_columns}."
+            )
 
     def _validate_or_fix_group(self, group: DQCheckGroup) -> DQCheckGroup:
         """
@@ -790,16 +969,24 @@ class SQLDQPlanner:
         return next((group for group in corrected_plan.groups if group.group_id == target_group_id), None)
 
     @staticmethod
-    def _build_user_message(prompts: dict[str, str]) -> str:
-        """Format the prompts dict as a numbered list for the LLM."""
+    def _build_user_message(
+        checks: list[DQCheckInput],
+        *,
+        fixed_validator_names: set[str] | None = None,
+    ) -> str:
+        """Format the checks list as a numbered list for the LLM."""
+        fixed = fixed_validator_names or set()
         lines = [
             "Generate a DQPlan for the following data-quality checks.\n",
             "IMPORTANT: Group checks by (table, check_category). Max "
             f"{_MAX_CHECKS_PER_GROUP} checks per group — split into sub-groups if needed.\n",
+            "For each check, also fill validator_name and validator_args from the "
+            "AVAILABLE VALIDATORS list in the system prompt.\n",
             "Checks:",
         ]
-        for check_name, description in prompts.items():
-            lines.append(f'  - check_name="{check_name}": {description}')
+        for check in checks:
+            suffix = " [FIXED VALIDATOR - set validator_name to null]" if check.name in fixed else ""
+            lines.append(f'  - check_name="{check.name}": {check.description}{suffix}')
         return "\n".join(lines)
 
     def execute_unexpected_queries(
@@ -906,17 +1093,17 @@ class SQLDQPlanner:
                 )
 
     @staticmethod
-    def _validate_plan_coverage(plan: DQPlan, prompts: dict[str, str]) -> None:
+    def _validate_plan_coverage(plan: DQPlan, check_descriptions: dict[str, str]) -> None:
         """
-        Raise :class:`ValueError` when the plan's ``check_names`` differ from ``prompts.keys()``.
+        Raise :class:`ValueError` when the plan's ``check_names`` differ from the input checks.
 
-        Surfaces both missing checks (LLM dropped a prompt) and extra checks
-        (LLM hallucinated a check not in the prompts) in a single error message.
+        Surfaces both missing checks (LLM dropped a check) and extra checks
+        (LLM hallucinated a check not in the input) in a single error message.
         """
-        expected = set(prompts.keys())
+        expected = set(check_descriptions.keys())
         returned_list = plan.check_names
-        if len(returned_list) != len(set(returned_list)):
-            duplicates = sorted({n for n in returned_list if returned_list.count(n) > 1})
+        duplicates = sorted(name for name, count in Counter(returned_list).items() if count > 1)
+        if duplicates:
             raise ValueError(
                 f"LLM-generated DQPlan contains duplicate check_name entries: {duplicates}. "
                 "Each check_name must be unique within a plan."
@@ -927,9 +1114,9 @@ class SQLDQPlanner:
         extra = returned - expected
 
         if missing or extra:
-            parts: list[str] = ["LLM-generated DQPlan does not match the provided prompts."]
+            parts: list[str] = ["LLM-generated DQPlan does not match the provided checks."]
             if missing:
-                parts.append(f"  Missing checks (in prompts but not in plan): {sorted(missing)}")
+                parts.append(f"  Missing checks (in checks but not in plan): {sorted(missing)}")
             if extra:
-                parts.append(f"  Extra checks (in plan but not in prompts):   {sorted(extra)}")
+                parts.append(f"  Extra checks (in plan but not in checks):   {sorted(extra)}")
             raise ValueError("\n".join(parts))

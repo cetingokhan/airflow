@@ -21,10 +21,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from airflow.providers.common.ai.hooks.pydantic_ai import PydanticAIHook
-from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQPlan
+from airflow.providers.common.ai.utils.dq_models import DQCheck, DQCheckGroup, DQCheckInput, DQPlan
 from airflow.providers.common.ai.utils.dq_planner import SQLDQPlanner, _extract_table_names
 from airflow.providers.common.ai.utils.sql_validation import SQLSafetyError
 from airflow.providers.common.sql.hooks.sql import DbApiHook
+
+
+def _make_checks(*check_names: str) -> list[DQCheckInput]:
+    """Helper: build a minimal checks list from names."""
+    return [DQCheckInput(name=n, description=f"check {n}") for n in check_names]
 
 
 def _make_plan(*check_names: str) -> DQPlan:
@@ -33,7 +38,15 @@ def _make_plan(*check_names: str) -> DQPlan:
         DQCheckGroup(
             group_id="numeric_aggregate",
             query=f"SELECT COUNT(*) AS {name}_count FROM t",
-            checks=[DQCheck(check_name=name, metric_key=f"{name}_count", group_id="numeric_aggregate")],
+            checks=[
+                DQCheck(
+                    check_name=name,
+                    metric_key=f"{name}_count",
+                    group_id="numeric_aggregate",
+                    validator_name="exact_check",
+                    validator_args={"expected": 0},
+                )
+            ],
         )
         for name in check_names
     ]
@@ -101,54 +114,54 @@ class TestSQLDQPlannerBuildSchema:
 
 class TestSQLDQPlannerGeneratePlan:
     def test_returns_plan_when_check_names_match(self):
-        prompts = {"null_emails": "check for null emails", "dup_ids": "check for duplicate ids"}
+        checks = _make_checks("null_emails", "dup_ids")
         plan = _make_plan("null_emails", "dup_ids")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        result = planner.generate_plan(prompts, schema_context="")
+        result = planner.generate_plan(checks, schema_context="")
 
-        assert set(result.check_names) == set(prompts.keys())
+        assert set(result.check_names) == {c.name for c in checks}
 
     def test_raises_when_llm_drops_a_check(self):
-        prompts = {"null_emails": "...", "dup_ids": "..."}
+        checks = _make_checks("null_emails", "dup_ids")
         plan = _make_plan("null_emails")  # missing dup_ids
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
         with pytest.raises(ValueError, match="dup_ids"):
-            planner.generate_plan(prompts, schema_context="")
+            planner.generate_plan(checks, schema_context="")
 
     def test_raises_when_llm_adds_extra_check(self):
-        prompts = {"null_emails": "..."}
+        checks = _make_checks("null_emails")
         plan = _make_plan("null_emails", "hallucinated_check")  # unexpected extra
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
         with pytest.raises(ValueError, match="hallucinated_check"):
-            planner.generate_plan(prompts, schema_context="")
+            planner.generate_plan(checks, schema_context="")
 
     def test_agent_receives_schema_context_in_prompt(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="Table: orders\nColumns: id INT")
+        planner.generate_plan(checks, schema_context="Table: orders\nColumns: id INT")
 
         call_kwargs = mock_hook.create_agent.call_args
         instructions = call_kwargs.kwargs["instructions"]
         assert "orders" in instructions
 
     def test_extra_system_prompt_appended_to_instructions(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(
             llm_hook=mock_hook, db_hook=None, system_prompt="Always use lowercase aliases."
         )
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         instructions = call_kwargs.kwargs["instructions"]
@@ -158,35 +171,35 @@ class TestSQLDQPlannerGeneratePlan:
 
     def test_empty_system_prompt_not_appended(self):
         """When system_prompt is empty (default), instructions must not contain 'Additional instructions'."""
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         instructions = call_kwargs.kwargs["instructions"]
         assert "Additional instructions" not in instructions
 
     def test_agent_params_forwarded_to_create_agent(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None, agent_params={"retries": 3})
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         assert call_kwargs.kwargs.get("retries") == 3
 
     def test_agent_params_empty_by_default(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         # Only output_type and instructions should be present — no extra kwargs.
@@ -194,14 +207,14 @@ class TestSQLDQPlannerGeneratePlan:
         assert extra == {}
 
     def test_prompt_bodies_logged_at_debug_only(self, caplog):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
 
         with caplog.at_level("INFO"):
-            planner.generate_plan(prompts, schema_context="Table: orders\nColumns: id INT")
+            planner.generate_plan(checks, schema_context="Table: orders\nColumns: id INT")
 
         assert "Generating DQ plan with" in caplog.text
         assert "Using system prompt:" not in caplog.text
@@ -209,7 +222,7 @@ class TestSQLDQPlannerGeneratePlan:
 
         caplog.clear()
         with caplog.at_level("DEBUG"):
-            planner.generate_plan(prompts, schema_context="Table: orders\nColumns: id INT")
+            planner.generate_plan(checks, schema_context="Table: orders\nColumns: id INT")
 
         assert "Using system prompt:" in caplog.text
         assert "Using user message:" in caplog.text
@@ -330,6 +343,51 @@ class TestSQLDQPlannerExecutePlan:
         with pytest.raises(ValueError, match="Unsupported row type"):
             planner.execute_plan(plan)
 
+    def test_raises_when_result_column_order_differs_from_check_order_for_dict_rows(self):
+        """Result columns must follow the same order as checks in the plan group."""
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_records.return_value = [{"second_metric": 2, "first_metric": 1}]
+
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT 1 AS first_metric, 2 AS second_metric FROM t",
+                    checks=[
+                        DQCheck(check_name="first", metric_key="first_metric", group_id="g"),
+                        DQCheck(check_name="second", metric_key="second_metric", group_id="g"),
+                    ],
+                )
+            ]
+        )
+
+        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook)
+        with pytest.raises(ValueError, match="unexpected order"):
+            planner.execute_plan(plan)
+
+    def test_raises_when_result_column_order_differs_from_check_order_for_tuple_rows(self):
+        """When last_description is available, column order must match check order."""
+        mock_db_hook = MagicMock(spec=DbApiHook)
+        mock_db_hook.get_records.return_value = [(1, 2)]
+        mock_db_hook.last_description = [("second_metric",), ("first_metric",)]
+
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT 1 AS first_metric, 2 AS second_metric FROM t",
+                    checks=[
+                        DQCheck(check_name="first", metric_key="first_metric", group_id="g"),
+                        DQCheck(check_name="second", metric_key="second_metric", group_id="g"),
+                    ],
+                )
+            ]
+        )
+
+        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook)
+        with pytest.raises(ValueError, match="unexpected order"):
+            planner.execute_plan(plan)
+
 
 class TestSQLDQPlannerExecutionBackends:
     """Tests for backend selection and DataFusion execution path."""
@@ -401,6 +459,34 @@ class TestSQLDQPlannerExecutionBackends:
             planner.execute_plan(self._simple_plan("null_count"))
 
     @patch("airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._build_datafusion_engine")
+    def test_datafusion_raises_when_result_column_order_differs_from_check_order(self, mock_build_engine):
+        """DataFusion result column order must align with plan check order."""
+        mock_engine = MagicMock()
+        mock_engine.execute_query.return_value = {"second_metric": [2], "first_metric": [1]}
+        mock_build_engine.return_value = mock_engine
+
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT 1 AS first_metric, 2 AS second_metric FROM t",
+                    checks=[
+                        DQCheck(check_name="first", metric_key="first_metric", group_id="g"),
+                        DQCheck(check_name="second", metric_key="second_metric", group_id="g"),
+                    ],
+                )
+            ]
+        )
+
+        planner = SQLDQPlanner(
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=None,
+            datasource_config=MagicMock(),
+        )
+        with pytest.raises(ValueError, match="unexpected order"):
+            planner.execute_plan(plan)
+
+    @patch("airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner._build_datafusion_engine")
     def test_datafusion_engine_built_once_for_multiple_groups(self, mock_build_engine):
         """DataFusion engine is instantiated once even when the plan has multiple groups."""
         mock_engine = MagicMock()
@@ -450,22 +536,29 @@ class TestSQLDQPlannerExecutionBackends:
 
 
 class TestSQLDQPlannerDialect:
-    def test_explicit_dialect_forwarded(self):
-        mock_db_hook = MagicMock(spec=[])  # no dialect_name attribute
+    @pytest.mark.parametrize(
+        ("case", "dialect_arg", "expected"),
+        [
+            ("explicit", "postgres", "postgres"),
+            ("auto", None, "postgres"),
+            ("none", None, None),
+        ],
+    )
+    def test_dialect_resolution(self, case, dialect_arg, expected):
+        if case == "explicit":
+            db_hook = MagicMock(spec=[])  # no dialect_name attribute
+        elif case == "auto":
+            db_hook = MagicMock()
+            db_hook.dialect_name = "postgresql"
+        else:
+            db_hook = None
+
         planner = SQLDQPlanner(
-            llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook, dialect="postgres"
+            llm_hook=MagicMock(spec=PydanticAIHook),
+            db_hook=db_hook,
+            dialect=dialect_arg,
         )
-        assert planner._dialect == "postgres"
-
-    def test_dialect_auto_detected_from_hook(self):
-        mock_db_hook = MagicMock()
-        mock_db_hook.dialect_name = "postgresql"
-        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=mock_db_hook)
-        assert planner._dialect == "postgres"  # normalised by resolve_dialect
-
-    def test_dialect_none_when_not_set(self):
-        planner = SQLDQPlanner(llm_hook=MagicMock(spec=PydanticAIHook), db_hook=None)
-        assert planner._dialect is None
+        assert planner._dialect == expected
 
     @patch("airflow.providers.common.ai.utils.dq_planner._validate_sql")
     def test_dialect_passed_to_validate_sql(self, mock_validate):
@@ -730,14 +823,14 @@ class TestSQLDQPlannerCollectUnexpected:
 
     def test_collect_unexpected_adds_prompt_section(self):
         """When collect_unexpected=True, the system prompt includes UNEXPECTED VALUE COLLECTION."""
-        prompts = {"phone_fmt": "check phone format"}
+        checks = _make_checks("phone_fmt")
         plan = _make_plan("phone_fmt")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(
             llm_hook=mock_hook, db_hook=None, collect_unexpected=True, unexpected_sample_size=50
         )
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         instructions = call_kwargs.kwargs["instructions"]
@@ -746,12 +839,12 @@ class TestSQLDQPlannerCollectUnexpected:
 
     def test_collect_unexpected_false_no_prompt_section(self):
         """When collect_unexpected=False (default), the prompt does NOT include unexpected section."""
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None, collect_unexpected=False)
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         call_kwargs = mock_hook.create_agent.call_args
         instructions = call_kwargs.kwargs["instructions"]
@@ -893,12 +986,12 @@ class TestSQLDQPlannerCollectUnexpected:
 
     def test_grouping_prompt_includes_category_and_max_checks(self):
         """System prompt contains category list and max-checks-per-group rule."""
-        prompts = {"c1": "check"}
+        checks = _make_checks("c1")
         plan = _make_plan("c1")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
         assert "null_check" in instructions
@@ -1341,7 +1434,7 @@ class TestSQLDQPlannerDuplicateCheckName:
 
     def test_raises_when_plan_has_duplicate_check_names(self):
         """A plan where the same check_name appears in two groups must raise ValueError."""
-        prompts = {"null_emails": "check for null emails"}
+        checks = _make_checks("null_emails")
         # LLM returns check_name "null_emails" in two separate groups (duplicate)
         duplicate_plan = DQPlan(
             groups=[
@@ -1360,16 +1453,100 @@ class TestSQLDQPlannerDuplicateCheckName:
         mock_hook = _make_llm_hook(duplicate_plan)
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
         with pytest.raises(ValueError, match="null_emails"):
-            planner.generate_plan(prompts, schema_context="")
+            planner.generate_plan(checks, schema_context="")
 
     def test_unique_check_names_do_not_raise(self):
         """A plan with all unique check_names must pass coverage validation."""
-        prompts = {"check_a": "...", "check_b": "..."}
+        checks = _make_checks("check_a", "check_b")
         valid_plan = _make_plan("check_a", "check_b")
         mock_hook = _make_llm_hook(valid_plan)
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        result = planner.generate_plan(prompts, schema_context="")
+        result = planner.generate_plan(checks, schema_context="")
         assert set(result.check_names) == {"check_a", "check_b"}
+
+
+class TestSQLDQPlannerValidatorSelectionValidation:
+    """Planner must fail closed when LLM validator selection is missing/invalid."""
+
+    def test_raises_when_non_fixed_check_has_null_validator_name(self):
+        checks = _make_checks("null_emails")
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT COUNT(*) AS null_email_count FROM t",
+                    checks=[
+                        DQCheck(
+                            check_name="null_emails",
+                            metric_key="null_email_count",
+                            group_id="g",
+                            validator_name=None,
+                            validator_args={},
+                        )
+                    ],
+                )
+            ]
+        )
+        mock_hook = _make_llm_hook(plan)
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None, max_validator_retries=1)
+
+        with pytest.raises(ValueError, match="validator_name is null or 'none'"):
+            planner.generate_plan(checks, schema_context="")
+
+    def test_raises_when_non_fixed_check_has_none_validator_name(self):
+        checks = _make_checks("null_emails")
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT COUNT(*) AS null_email_count FROM t",
+                    checks=[
+                        DQCheck(
+                            check_name="null_emails",
+                            metric_key="null_email_count",
+                            group_id="g",
+                            validator_name="none",
+                            validator_args={},
+                        )
+                    ],
+                )
+            ]
+        )
+        mock_hook = _make_llm_hook(plan)
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None, max_validator_retries=1)
+
+        with pytest.raises(ValueError, match="validator_name is null or 'none'"):
+            planner.generate_plan(checks, schema_context="")
+
+    def test_fixed_validator_check_can_keep_null_validator_name(self):
+        checks = _make_checks("null_emails")
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT COUNT(*) AS null_email_count FROM t",
+                    checks=[
+                        DQCheck(
+                            check_name="null_emails",
+                            metric_key="null_email_count",
+                            group_id="g",
+                            validator_name=None,
+                            validator_args={},
+                        )
+                    ],
+                )
+            ]
+        )
+        mock_hook = _make_llm_hook(plan)
+        planner = SQLDQPlanner(
+            llm_hook=mock_hook,
+            db_hook=None,
+            max_validator_retries=1,
+            fixed_validators={"null_emails": lambda v: v == 0},
+        )
+
+        result = planner.generate_plan(checks, schema_context="")
+        assert result.check_names == ["null_emails"]
 
 
 class TestSQLDQPlannerRowLevelMetricKeyValidation:
@@ -1485,36 +1662,36 @@ class TestExtractTableNames:
 
 class TestTableNameConstraintInPrompt:
     def test_constraint_included_when_schema_has_tables(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="Table: sales_data\nColumns: id INT")
+        planner.generate_plan(checks, schema_context="Table: sales_data\nColumns: id INT")
 
         instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
         assert "TABLE NAME CONSTRAINT" in instructions
         assert "sales_data" in instructions
 
     def test_constraint_not_included_when_schema_empty(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context="")
+        planner.generate_plan(checks, schema_context="")
 
         instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
         assert "TABLE NAME CONSTRAINT" not in instructions
 
     def test_constraint_lists_multiple_tables(self):
-        prompts = {"row_count": "count rows"}
+        checks = _make_checks("row_count")
         plan = _make_plan("row_count")
         mock_hook = _make_llm_hook(plan)
 
         schema = "Table: orders\nColumns: id INT\n\nTable: customers\nColumns: id INT"
         planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None)
-        planner.generate_plan(prompts, schema_context=schema)
+        planner.generate_plan(checks, schema_context=schema)
 
         instructions = mock_hook.create_agent.call_args.kwargs["instructions"]
         assert "orders, customers" in instructions

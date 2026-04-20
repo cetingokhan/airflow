@@ -23,11 +23,11 @@
 Use :class:`~airflow.providers.common.ai.operators.llm_data_quality.LLMDataQualityOperator`
 to generate and execute data-quality checks from natural language using an LLM.
 
-Each entry in ``prompts`` describes **one** data-quality expectation.
+Each entry in ``checks`` describes **one** data-quality expectation as a
+:class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput` object.
 The LLM groups related checks into optimised SQL queries, executes them against the
-target database, and validates each metric against the corresponding entry in
-``validators``.  The task fails if any check does not pass, gating downstream tasks
-on data quality.
+target database, and validates each metric.  The task fails if any check does not
+pass, gating downstream tasks on data quality.
 
 .. seealso::
     :ref:`Connection configuration <howto/connection:pydanticai>`
@@ -35,12 +35,13 @@ on data quality.
 Basic Usage
 -----------
 
-Provide a ``prompts`` dict and a target ``db_conn_id``. The operator introspects the
+Provide a ``checks`` list and a target ``db_conn_id``. The operator introspects the
 schema automatically when ``table_names`` is provided:
 
 .. code-block:: python
 
     from airflow.providers.common.ai.operators.llm_data_quality import LLMDataQualityOperator
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
     from airflow.providers.common.ai.utils.dq_validation import null_pct_check, row_count_check
 
     LLMDataQualityOperator(
@@ -48,22 +49,26 @@ schema automatically when ``table_names`` is provided:
         llm_conn_id="pydanticai_default",
         db_conn_id="postgres_default",
         table_names=["orders", "customers"],
-        prompts={
-            "row_count": "The orders table must contain at least 1000 rows.",
-            "email_nulls": "No more than 5% of customer email addresses should be null.",
-        },
-        validators={
-            "row_count": row_count_check(min_count=1000),
-            "email_nulls": null_pct_check(max_pct=0.05),
-        },
+        checks=[
+            DQCheckInput(
+                name="row_count",
+                description="The orders table must contain at least 1000 rows.",
+                validator=row_count_check(min_count=1000),
+            ),
+            DQCheckInput(
+                name="email_nulls",
+                description="No more than 5% of customer email addresses should be null.",
+                validator=null_pct_check(max_pct=0.05),
+            ),
+        ],
     )
 
 Validators
 ----------
 
-The ``validators`` dict maps each check name to a callable that receives the raw
-metric value returned by the generated SQL and returns ``True`` (pass) or
-``False`` (fail).
+Each :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput` can carry
+an optional ``validator`` — a callable that receives the raw metric value returned
+by the generated SQL and returns ``True`` (pass) or ``False`` (fail).
 
 Built-in Factories
 ~~~~~~~~~~~~~~~~~~
@@ -96,10 +101,11 @@ for the most common thresholds:
 
 You can also use plain lambdas for one-off conditions::
 
-    validators = {
-        "stale_rows": lambda v: int(v) < 1000,
-        "revenue_range": lambda v: 0.0 <= float(v) <= 1_000_000.0,
-    }
+    DQCheckInput(
+        name="stale_rows",
+        description="Count rows older than 30 days",
+        validator=lambda v: int(v) < 1000,
+    )
 
 Aggregate checks without a validator are marked as **passed** — metrics are
 still collected and included in the report, but no threshold is enforced.
@@ -129,6 +135,7 @@ accurate SQL:
 .. code-block:: python
 
     from airflow.providers.common.ai.operators.llm_data_quality import LLMDataQualityOperator
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
     from airflow.providers.common.ai.utils.dq_validation import (
         duplicate_pct_check,
         exact_check,
@@ -142,18 +149,28 @@ accurate SQL:
         db_conn_id="postgres_default",
         table_names=["customers"],
         prompt_version="v1",
-        prompts={
-            "null_emails": "Check the percentage of rows where email is NULL",
-            "duplicate_ids": "Calculate the percentage of duplicate customer IDs",
-            "negative_balance": "Count rows where account_balance is negative",
-            "min_customers": "Count the total number of customer rows",
-        },
-        validators={
-            "null_emails": null_pct_check(max_pct=0.01),
-            "duplicate_ids": duplicate_pct_check(max_pct=0.0),
-            "negative_balance": exact_check(expected=0),
-            "min_customers": row_count_check(min_count=10_000),
-        },
+        checks=[
+            DQCheckInput(
+                name="null_emails",
+                description="Check the percentage of rows where email is NULL",
+                validator=null_pct_check(max_pct=0.01),
+            ),
+            DQCheckInput(
+                name="duplicate_ids",
+                description="Calculate the percentage of duplicate customer IDs",
+                validator=duplicate_pct_check(max_pct=0.0),
+            ),
+            DQCheckInput(
+                name="negative_balance",
+                description="Count rows where account_balance is negative",
+                validator=exact_check(expected=0),
+            ),
+            DQCheckInput(
+                name="min_customers",
+                description="Count the total number of customer rows",
+                validator=row_count_check(min_count=10_000),
+            ),
+        ],
     )
 
 With Manual Schema Context
@@ -172,12 +189,13 @@ time, pass a manual schema description via ``schema_context``:
             "Table: orders(id INT, customer_id INT, amount DECIMAL, created_at TIMESTAMP)\n"
             "Table: customers(id INT, email TEXT, country TEXT)"
         ),
-        prompts={
-            "null_amount": "Check the percentage of orders with a NULL amount",
-        },
-        validators={
-            "null_amount": null_pct_check(max_pct=0.0),
-        },
+        checks=[
+            DQCheckInput(
+                name="null_amount",
+                description="Check the percentage of orders with a NULL amount",
+                validator=null_pct_check(max_pct=0.0),
+            ),
+        ],
     )
 
 With Object Storage
@@ -295,31 +313,39 @@ DAG run.
 Cache key
 ~~~~~~~~~
 
-The cache key is derived from a SHA-256 digest of the sorted ``prompts`` dict
+The cache key is derived from a SHA-256 digest of the sorted checks list
 plus all planning-affecting inputs: ``prompt_version``, schema context,
 unexpected-row collection settings, row-level sample size, validator LLM
 context, and row-level validator thresholds. The key format is::
 
     dq_plan_{version_tag}_{sha256[:16]}
 
-Because it is order-independent, reordering keys in ``prompts`` does **not**
+Because it is order-independent, reordering checks does **not**
 invalidate the cache.
 
 Invalidating the Cache
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Bump ``prompt_version`` whenever the intent of a prompt changes, even if the
+Bump ``prompt_version`` whenever the intent of a check changes, even if the
 text is the same:
 
 .. code-block:: python
+
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
+    from airflow.providers.common.ai.utils.dq_validation import row_count_check
 
     LLMDataQualityOperator(
         task_id="validate_orders",
         prompt_version="v2",  # was "v1" — forces a new LLM call
         llm_conn_id="pydanticai_default",
         db_conn_id="postgres_default",
-        prompts={"row_count": "The orders table must contain at least 5000 rows."},
-        validators={"row_count": row_count_check(min_count=5000)},
+        checks=[
+            DQCheckInput(
+                name="row_count",
+                description="The orders table must contain at least 5000 rows.",
+                validator=row_count_check(min_count=5000),
+            ),
+        ],
     )
 
 Dry Run Mode
@@ -368,13 +394,21 @@ reviewer approves.  If the reviewer rejects, the task raises
 
 .. code-block:: python
 
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
+    from airflow.providers.common.ai.utils.dq_validation import row_count_check
+
     LLMDataQualityOperator(
         task_id="validate_with_approval",
         llm_conn_id="pydanticai_default",
         db_conn_id="postgres_default",
         table_names=["orders"],
-        prompts={"row_count": "The orders table must have at least 1000 rows."},
-        validators={"row_count": row_count_check(min_count=1000)},
+        checks=[
+            DQCheckInput(
+                name="row_count",
+                description="The orders table must have at least 1000 rows.",
+                validator=row_count_check(min_count=1000),
+            ),
+        ],
         require_approval=True,
         allow_modifications=False,
     )
@@ -393,12 +427,13 @@ full set of HITL parameters (``require_approval``, ``approval_timeout``,
 TaskFlow Decorator
 ------------------
 
-The ``@task.llm_dq`` decorator lets you write a function that returns the
-``prompts`` dict. The decorator handles LLM plan generation, plan caching, SQL
-execution, and metric validation:
+The ``@task.llm_dq`` decorator lets you write a function that returns a
+``list[DQCheckInput]``. The decorator handles LLM plan generation, plan caching,
+SQL execution, and metric validation:
 
 .. code-block:: python
 
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
     from airflow.providers.common.ai.utils.dq_validation import (
         null_pct_check,
         row_count_check,
@@ -412,16 +447,20 @@ execution, and metric validation:
             llm_conn_id="pydanticai_default",
             db_conn_id="postgres_default",
             table_names=["orders", "customers"],
-            validators={
-                "row_count": row_count_check(min_count=1000),
-                "email_nulls": null_pct_check(max_pct=0.05),
-            },
         )
         def dq_checks(ds=None):
-            return {
-                "row_count": f"The orders table must have at least 1000 rows as of {ds}.",
-                "email_nulls": "No more than 5% of customer emails should be null.",
-            }
+            return [
+                DQCheckInput(
+                    name="row_count",
+                    description=f"The orders table must have at least 1000 rows as of {ds}.",
+                    validator=row_count_check(min_count=1000),
+                ),
+                DQCheckInput(
+                    name="email_nulls",
+                    description="No more than 5% of customer emails should be null.",
+                    validator=null_pct_check(max_pct=0.05),
+                ),
+            ]
 
         dq_checks()
 
@@ -429,13 +468,7 @@ execution, and metric validation:
     validate_pipeline()
 
 The function body can use Airflow context variables, XCom pulls, or any
-runtime information to build the prompts dict dynamically.
-
-.. note::
-    Validator key validation is deferred to execution time when using the
-    ``@task.llm_dq`` decorator, because ``prompts`` is not known until the
-    callable runs. Any ``validators`` key that does not appear in the dict
-    returned by the callable raises ``ValueError`` at task execution time.
+runtime information to build the checks list dynamically.
 
 Logging
 -------

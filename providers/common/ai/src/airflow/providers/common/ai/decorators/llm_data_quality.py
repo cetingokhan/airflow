@@ -17,10 +17,10 @@
 """
 TaskFlow decorator for LLM-driven data-quality checks.
 
-The user writes a function that **returns the prompts dict** — a mapping of
-``{check_name: natural_language_description}``.  The decorator handles LLM
-plan generation, plan caching, SQL execution against the target database, and
-metric validation.
+The user writes a function that **returns a list of
+:class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput`** objects.
+The decorator handles LLM plan generation, plan caching, SQL execution against
+the target database, and metric validation.
 """
 
 from __future__ import annotations
@@ -44,15 +44,15 @@ if TYPE_CHECKING:
 
 class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
     """
-    Wraps a callable that returns a prompts dict for LLM data-quality checks.
+    Wraps a callable that returns a list of :class:`DQCheckInput` for LLM data-quality checks.
 
-    The user function is called at execution time to produce the prompts dict.
+    The user function is called at execution time to produce the checks list.
     All other parameters (``llm_conn_id``, ``db_conn_id``, ``table_names``,
-    ``validators``, etc.) are passed through to
+    etc.) are passed through to
     :class:`~airflow.providers.common.ai.operators.llm_data_quality.LLMDataQualityOperator`.
 
-    :param python_callable: A callable that returns a ``dict[str, str]`` mapping
-        check names to natural-language descriptions.
+    :param python_callable: A callable that returns a
+        ``list[DQCheckInput]``.
     :param op_args: Positional arguments for the callable.
     :param op_kwargs: Keyword arguments for the callable.
     """
@@ -75,12 +75,11 @@ class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
         op_kwargs: Mapping[str, Any] | None = None,
         **kwargs,
     ) -> None:
-        # Defer prompt validation until execute() populates prompts from python_callable.
         super().__init__(
             python_callable=python_callable,
             op_args=op_args,
             op_kwargs=op_kwargs,
-            prompts=SET_DURING_EXECUTION,
+            checks=SET_DURING_EXECUTION,
             **kwargs,
         )
 
@@ -88,15 +87,14 @@ class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
         context_merge(context, self.op_kwargs)
         kwargs = determine_kwargs(self.python_callable, self.op_args, context)
 
-        self.prompts = self.python_callable(*self.op_args, **kwargs)
+        checks = self.python_callable(*self.op_args, **kwargs)
 
-        if not isinstance(self.prompts, dict) or not self.prompts:
+        if not isinstance(checks, list) or not checks:
             raise TypeError(
-                "The returned value from the @task.llm_dq callable must be a non-empty dict[str, str]."
+                "The returned value from the @task.llm_dq callable must be a non-empty list[DQCheckInput]."
             )
 
-        self._validate_validator_keys()
-
+        self.checks = checks
         self.render_template_fields(context)
         return LLMDataQualityOperator.execute(self, context)
 
@@ -106,15 +104,15 @@ def llm_dq_task(
     **kwargs,
 ) -> TaskDecorator:
     """
-    Wrap a function that returns a prompts dict into an LLM data-quality task.
+    Wrap a function that returns a checks list into an LLM data-quality task.
 
-    The function body builds the ``{check_name: description}`` mapping (can use
-    Airflow context, XCom, etc.). The decorator handles: LLM plan generation,
-    plan caching, SQL execution against the target database, and metric
-    validation.
+    The function body builds a ``list[DQCheckInput]`` (can use Airflow context,
+    XCom, etc.).  The decorator handles: LLM plan generation, plan caching,
+    SQL execution against the target database, and metric validation.
 
     Usage::
 
+        from airflow.providers.common.ai.utils.dq_models import DQCheckInput
         from airflow.providers.common.ai.utils.dq_validation import (
             null_pct_check,
             row_count_check,
@@ -125,16 +123,20 @@ def llm_dq_task(
             llm_conn_id="openai_default",
             db_conn_id="postgres_default",
             table_names=["orders", "customers"],
-            validators={
-                "row_count": row_count_check(min_count=1000),
-                "email_nulls": null_pct_check(max_pct=0.05),
-            },
         )
         def dq_checks(ds=None):
-            return {
-                "row_count": f"The orders table must have at least 1000 rows as of {ds}.",
-                "email_nulls": "No more than 5% of customer emails should be null.",
-            }
+            return [
+                DQCheckInput(
+                    name="row_count",
+                    description=f"The orders table must have at least 1000 rows as of {ds}.",
+                    validator=row_count_check(min_count=1000),
+                ),
+                DQCheckInput(
+                    name="email_nulls",
+                    description="No more than 5% of customer emails should be null.",
+                    validator=null_pct_check(max_pct=0.05),
+                ),
+            ]
 
     With ``dry_run=True`` to preview the generated plan before execution::
 
@@ -145,10 +147,15 @@ def llm_dq_task(
             dry_run=True,
         )
         def preview_plan():
-            return {"row_count": "The orders table must have at least 1000 rows."}
+            return [
+                DQCheckInput(
+                    name="row_count",
+                    description="The orders table must have at least 1000 rows.",
+                ),
+            ]
 
     :param python_callable: Function to decorate.  Must return a non-empty
-        ``dict[str, str]`` mapping check names to natural-language descriptions.
+        ``list[DQCheckInput]``.
     """
     return task_decorator_factory(
         python_callable=python_callable,

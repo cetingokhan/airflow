@@ -18,303 +18,25 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 from airflow.providers.common.ai.operators.llm_data_quality import LLMDataQualityOperator
+from airflow.providers.common.ai.utils.dq_models import DQCheckInput
 from airflow.providers.common.ai.utils.dq_validation import (
-    duplicate_pct_check,
     exact_check,
     null_pct_check,
     register_validator,
-    row_count_check,
 )
-from airflow.providers.common.compat.sdk import dag
+from airflow.providers.common.compat.sdk import dag, task
 from airflow.providers.common.sql.config import DataSourceConfig
-from airflow.providers.standard.operators.hitl import ApprovalOperator
-
-
-# [START howto_operator_llm_dq_s3_parquet]
-@dag
-def example_llm_dq_s3_parquet():
-    """
-    Run data-quality checks on a Parquet dataset stored in Amazon S3.
-
-    DataFusion is used to register the S3 source so the LLM can introspect
-    its schema and generate the appropriate SQL.
-
-    Connections required:
-    - ``pydanticai_default``: Pydantic AI connection with Bedrock.
-    - ``aws_default``: AWS connection with S3 read permissions.
-    """
-    datasource_config = DataSourceConfig(
-        conn_id="aws_default",
-        table_name="sales_events",
-        uri="s3://my-data-lake/events/sales/year=2025/",
-        format="parquet",
-    )
-
-    LLMDataQualityOperator(
-        task_id="validate_sales_events",
-        llm_conn_id="pydanticai_default",
-        datasource_config=datasource_config,
-        prompt_version="v1",
-        prompts={
-            "null_event_id": "Check the percentage of rows where event_id is NULL",
-            "invalid_revenue": "Count rows where revenue is negative or NULL",
-            "stale_data": "Count rows where event_timestamp is older than 90 days",
-            "duplicate_events": "Calculate the percentage of duplicate event_id values",
-            "min_row_count": "Count the total number of rows in the dataset",
-        },
-        validators={
-            "null_event_id": null_pct_check(max_pct=0.0),
-            "invalid_revenue": exact_check(expected=0),
-            "stale_data": lambda v: int(v) < 1000,
-            "duplicate_events": duplicate_pct_check(max_pct=0.0),
-            "min_row_count": row_count_check(min_count=1_000_000),
-        },
-    )
-
-
-# [END howto_operator_llm_dq_s3_parquet]
-
-example_llm_dq_s3_parquet()
-
-
-_DQ_PROMPTS = {
-    "null_order_id": "Check the percentage of rows where order_id is NULL",
-    "negative_amount": "Count rows where order_amount is negative or NULL",
-    "duplicate_orders": "Calculate the percentage of duplicate order_id values",
-    "min_row_count": "Count the total number of rows in the orders table",
-}
-
-_DQ_VALIDATORS = {
-    "null_order_id": null_pct_check(max_pct=0.0),
-    "negative_amount": exact_check(expected=0),
-    "duplicate_orders": duplicate_pct_check(max_pct=0.0),
-    "min_row_count": row_count_check(min_count=10_000),
-}
-
-_DQ_COMMON_KWARGS = dict(
-    llm_conn_id="pydanticai_default",
-    db_conn_id="postgres_default",
-    table_names=["orders"],
-    prompt_version="v1",
-    prompts=_DQ_PROMPTS,
-    collect_unexpected=True,
-)
-
-
-# [START howto_operator_llm_dq_with_human_approval]
-@dag
-def example_llm_dq_with_approval():
-    """
-    Generate a DQ plan, let a human review it, then execute the checks.
-
-    Workflow:
-
-    - ``preview_dq_plan`` runs with ``dry_run=True`` to generate (and cache) the SQL
-      plan via the LLM, but does **not** execute it. It returns the serialised
-      plan dict via XCom so the approver can review the generated SQL.
-    - ``approve_dq_plan`` pauses the DAG and shows the generated SQL to the user.
-      Selecting "Approve" proceeds to execution; selecting "Reject" skips it.
-    - ``run_dq_checks`` executes the cached plan against the database and validates
-      each metric. Because the plan was already cached by ``preview_dq_plan``, the
-      LLM is **not** called a second time.
-
-    Connections required:
-
-    - ``pydanticai_default``: Pydantic AI connection (any supported LLM provider).
-    - ``postgres_default``: PostgreSQL connection for the target database.
-    """
-    preview_dq_plan = LLMDataQualityOperator(
-        task_id="preview_dq_plan",
-        dry_run=True,
-        **_DQ_COMMON_KWARGS,
-    )
-
-    approve_dq_plan = ApprovalOperator(
-        task_id="approve_dq_plan",
-        subject="Review the generated DQ plan before execution",
-        body=(
-            "The LLM generated the following SQL plan for the data-quality checks.\n"
-            "Please review it and approve or reject.\n\n"
-            "Plan:\n\n"
-            "```json\n"
-            "{{ ti.xcom_pull(task_ids='preview_dq_plan') | tojson(indent=2) }}\n"
-            "```"
-        ),
-    )
-
-    run_dq_checks = LLMDataQualityOperator(
-        task_id="run_dq_checks",
-        validators=_DQ_VALIDATORS,
-        **_DQ_COMMON_KWARGS,
-    )
-
-    preview_dq_plan >> approve_dq_plan >> run_dq_checks
-
-
-# [END howto_operator_llm_dq_with_human_approval]
-
-example_llm_dq_with_approval()
-
 
 # ------------------------------------------------------------------
-# Custom validator with LLM context
+# Module-level custom row-level validator used across multiple DAGs
 # ------------------------------------------------------------------
 
 
-# [START howto_operator_llm_dq_custom_validator]
-@register_validator(
-    "freshness_check",
-    llm_context=(
-        "Compute hours elapsed since the most recent row in the table. "
-        "SQL pattern: EXTRACT(EPOCH FROM (NOW() - MAX(timestamp_col))) / 3600.0. "
-        "Returns a DOUBLE representing hours elapsed."
-    ),
-    check_category="freshness",
-)
-def freshness_check(*, max_hours: float):
-    """Return a validator that passes when the metric value is at most *max_hours*."""
-
-    def _check(value):
-        try:
-            return float(value) <= max_hours
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"freshness_check(max_hours={max_hours!r}): expected a numeric value, got {value!r}"
-            ) from exc
-
-    return _check
-
-
-@dag
-def example_llm_dq_custom_validators():
-    """
-    Run data-quality checks using both built-in and custom validators.
-
-    Demonstrates the ``register_validator`` decorator which attaches
-    ``llm_context`` to a custom validator factory.  The operator
-    automatically injects the context into the LLM system prompt so the
-    model produces SQL that returns the metric format the validator expects.
-
-    Connections required:
-
-    - ``pydanticai_default``: Pydantic AI connection (any supported LLM provider).
-    - ``postgres_default``: PostgreSQL connection for the target database.
-    """
-    LLMDataQualityOperator(
-        task_id="validate_orders_with_custom_checks",
-        llm_conn_id="pydanticai_default",
-        db_conn_id="postgres_default",
-        table_names=["orders"],
-        prompt_version="v2",
-        prompts={
-            "null_order_id": "Check the percentage of rows where order_id is NULL",
-            "min_row_count": "Count the total number of rows in the orders table",
-            "order_freshness": "Check how many hours since the last order was placed",
-        },
-        validators={
-            "null_order_id": null_pct_check(max_pct=0.01),
-            "min_row_count": row_count_check(min_count=10_000),
-            "order_freshness": freshness_check(max_hours=24.0),
-        },
-    )
-
-
-# [END howto_operator_llm_dq_custom_validator]
-
-example_llm_dq_custom_validators()
-
-
-# [START howto_operator_llm_dq_dry_run_standalone]
-@dag
-def example_llm_dq_dry_run_standalone():
-    """
-    Preview the generated SQL plan without executing any checks.
-
-    ``dry_run=True`` generates and caches the DQ plan via the LLM but skips
-    all SQL execution.  The serialised plan dict (containing SQL queries,
-    check names, and metric keys) is returned as XCom so you can inspect
-    the generated queries before running them against production data.
-
-    Connections required:
-
-    - ``pydanticai_default``: Pydantic AI connection (any supported LLM provider).
-    - ``postgres_default``: PostgreSQL connection (schema introspection only;
-      no data is read).
-    """
-    LLMDataQualityOperator(
-        task_id="preview_products_plan",
-        llm_conn_id="pydanticai_default",
-        db_conn_id="postgres_default",
-        table_names=["products"],
-        dry_run=True,
-        prompt_version="v1",
-        prompts={
-            "null_sku": "Check the percentage of rows where sku is NULL",
-            "negative_price": "Count rows where price is negative or NULL",
-            "dup_sku": "Calculate the percentage of duplicate sku values",
-        },
-        validators={
-            "null_sku": null_pct_check(max_pct=0.0),
-            "negative_price": exact_check(expected=0),
-            "dup_sku": duplicate_pct_check(max_pct=0.0),
-        },
-    )
-
-
-# [END howto_operator_llm_dq_dry_run_standalone]
-
-example_llm_dq_dry_run_standalone()
-
-
-# [START howto_operator_llm_dq_require_approval_builtin]
-@dag
-def example_llm_dq_require_approval_builtin():
-    """
-    Gate SQL execution on human review using the built-in HITL mechanism.
-
-    Unlike the manual three-step flow (``dry_run`` → ``ApprovalOperator`` →
-    execute), ``require_approval=True`` keeps human-in-the-loop entirely
-    within a single operator.  After generating and caching the DQ plan the
-    task defers; checks run only after the reviewer approves via the
-    Airflow UI.  The plan SQL is shown to the reviewer in a structured
-    markdown summary.
-
-    Connections required:
-
-    - ``pydanticai_default``: Pydantic AI connection (any supported LLM provider).
-    - ``postgres_default``: PostgreSQL connection for the target database.
-    """
-    LLMDataQualityOperator(
-        task_id="validate_users_with_approval",
-        llm_conn_id="pydanticai_default",
-        db_conn_id="postgres_default",
-        table_names=["users"],
-        require_approval=True,
-        prompt_version="v1",
-        prompts={
-            "null_username": "Check the percentage of rows where username is NULL",
-            "null_email": "Check the percentage of rows where email is NULL",
-            "dup_email": "Calculate the percentage of duplicate email values",
-            "min_users": "Count the total number of rows in the users table",
-        },
-        validators={
-            "null_username": null_pct_check(max_pct=0.0),
-            "null_email": null_pct_check(max_pct=0.0),
-            "dup_email": duplicate_pct_check(max_pct=0.0),
-            "min_users": row_count_check(min_count=1000),
-        },
-    )
-
-
-# [END howto_operator_llm_dq_require_approval_builtin]
-
-example_llm_dq_require_approval_builtin()
-
-
-# [START howto_operator_llm_dq_custom_row_level_validator]
+# [START howto_operator_llm_dq_email_format_validator]
 @register_validator(
     "email_format_check",
     llm_context=(
@@ -337,44 +59,299 @@ def email_format_check(*, max_invalid_pct: float = 0.0):
     return _check
 
 
+# [END howto_operator_llm_dq_email_format_validator]
+
+
+# [START howto_operator_llm_dq_datafusion_classic]
 @dag
-def example_llm_dq_custom_row_level_validator():
+def example_llm_dq_datafusion_classic():
     """
-    Apply a custom row-level validator to verify email address formatting.
+    Run data-quality checks on a DataFusion (S3 Parquet) dataset using the classic operator.
 
-    ``email_format_check`` is registered with ``row_level=True``, which tells
-    the LLM to generate a plain ``SELECT id, email FROM table`` query with no
-    aggregation.  The planner fetches every row (or up to
-    ``row_level_sample_size`` rows), applies the regex validator per value,
-    and aggregates the results into a
-    :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`.
-
-    Use this pattern for any domain-specific, per-row validation logic that
-    cannot be expressed as a single SQL aggregate metric.
+    ``null_session_id`` and ``duplicate_sessions`` have no fixed validator; the LLM
+    selects an appropriate validator from the built-in registry automatically.
+    ``invalid_click_count`` uses a fixed ``exact_check`` validator so the LLM is
+    not asked to suggest one for that check.
 
     Connections required:
 
-    - ``pydanticai_default``: Pydantic AI connection (any supported LLM provider).
-    - ``postgres_default``: PostgreSQL connection for the target database.
+    - ``pydanticai_default``: Pydantic AI connection (Bedrock, OpenAI, etc.).
+    - ``aws_default``: AWS connection with S3 read permissions.
+    """
+    datasource_config = DataSourceConfig(
+        conn_id="aws_default",
+        table_name="web_clicks",
+        uri="s3://my-data-lake/web/clicks/year=2025/",
+        format="parquet",
+    )
+
+    LLMDataQualityOperator(
+        task_id="validate_web_clicks",
+        llm_conn_id="pydanticai_default",
+        datasource_config=datasource_config,
+        prompt_version="v1",
+        checks=[
+            DQCheckInput(
+                name="null_session_id",
+                description="Check the percentage of rows where session_id is NULL",
+            ),
+            DQCheckInput(
+                name="invalid_click_count",
+                description="Count rows where click_count is negative",
+                validator=exact_check(expected=0),
+            ),
+            DQCheckInput(
+                name="duplicate_sessions",
+                description="Calculate the percentage of duplicate session_id values",
+            ),
+        ],
+    )
+
+
+# [END howto_operator_llm_dq_datafusion_classic]
+
+example_llm_dq_datafusion_classic()
+
+
+# [START howto_operator_llm_dq_postgres_seed_classic]
+@dag
+def example_llm_dq_postgres_seed_classic():
+    """
+    Run data-quality checks on seeded PostgreSQL tables (``orders`` and ``customers``).
+
+    The tables are defined in ``001_schema_and_seed.sql``.  Most checks have no
+    fixed validator — the LLM selects an appropriate one from the built-in registry.
+    ``negative_amount`` uses a plain ``lambda`` as a lightweight one-off validator.
+    ``customer_email_format`` is a row-level check: the planner fetches each row
+    and applies the ``email_format_check`` regex per value, aggregating the outcome
+    into a :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection pointing at the seeded database.
     """
     LLMDataQualityOperator(
-        task_id="validate_email_format",
+        task_id="validate_orders_and_customers",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["orders", "customers"],
+        prompt_version="v1",
+        row_level_sample_size=50_000,
+        checks=[
+            DQCheckInput(
+                name="null_order_id",
+                description="Check the percentage of rows in orders where order_id is NULL",
+            ),
+            DQCheckInput(
+                name="duplicate_orders",
+                description="Calculate the percentage of duplicate order_id values in orders",
+            ),
+            DQCheckInput(
+                name="null_customer_email",
+                description="Check the percentage of rows in customers where email is NULL",
+            ),
+            DQCheckInput(
+                name="min_order_count",
+                description="Count the total number of rows in the orders table",
+            ),
+            DQCheckInput(
+                name="negative_amount",
+                description="Count rows in orders where order_amount is negative or NULL",
+                validator=lambda v: int(v) == 0,
+            ),
+            DQCheckInput(
+                name="customer_email_format",
+                description="Validate that each email in the customers table matches a valid email format",
+                validator=email_format_check(max_invalid_pct=0.01),
+            ),
+        ],
+    )
+
+
+# [END howto_operator_llm_dq_postgres_seed_classic]
+
+example_llm_dq_postgres_seed_classic()
+
+
+# [START howto_operator_llm_dq_task_decorator]
+@dag
+def example_llm_dq_task_decorator():
+    """
+    Combine a ``@task``-decorated step with a ``@task.llm_dq``-decorated DQ task.
+
+    ``notify_start`` is a plain ``@task`` that runs first to signal an upstream
+    condition (e.g. loading configuration or triggering an upstream pipeline).
+    ``validate_users`` is decorated with ``@task.llm_dq``: the function body
+    returns the checks list, and the decorator handles LLM plan generation, plan
+    caching, SQL execution, and metric validation.  Both checks have no fixed
+    validator — the LLM selects appropriate ones from the built-in registry.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection for the ``users`` table.
+    """
+
+    @task
+    def notify_start() -> dict:
+        """Log the start of the validation run and return a run metadata dict."""
+        log = logging.getLogger(__name__)
+        log.info("Starting DQ validation for the users table.")
+        return {"status": "started"}
+
+    @task.llm_dq(
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["users"],
+        prompt_version="v1",
+    )
+    def validate_users():
+        return [
+            DQCheckInput(
+                name="null_username",
+                description="Check the percentage of rows where username is NULL",
+            ),
+            DQCheckInput(
+                name="null_email",
+                description="Check the percentage of rows where email is NULL",
+            ),
+        ]
+
+    notify_start() >> validate_users()
+
+
+# [END howto_operator_llm_dq_task_decorator]
+
+example_llm_dq_task_decorator()
+
+
+# [START howto_operator_llm_dq_simple_builtin_approval]
+@dag
+def example_llm_dq_simple_builtin_approval():
+    """
+    Gate DQ check execution on human review using the built-in HITL mechanism.
+
+    ``require_approval=True`` defers the task after plan generation and surfaces
+    the generated SQL plan to a human reviewer in the Airflow UI.  The two checks
+    have no fixed validator — the LLM selects appropriate ones automatically.
+    Checks run only after the reviewer approves.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection for the ``products`` table.
+    """
+    LLMDataQualityOperator(
+        task_id="validate_products_with_approval",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["products"],
+        require_approval=True,
+        prompt_version="v1",
+        checks=[
+            {"name": "null_sku", "description": "Check the percentage of rows where sku is NULL"},
+            {"name": "negative_price", "description": "Count rows where price is negative or NULL"},
+        ],
+    )
+
+
+# [END howto_operator_llm_dq_simple_builtin_approval]
+
+example_llm_dq_simple_builtin_approval()
+
+
+# [START howto_operator_llm_dq_dry_run_preview]
+@dag
+def example_llm_dq_dry_run_preview():
+    """
+    Preview the generated SQL plan without executing any checks.
+
+    ``dry_run=True`` generates and caches the DQ plan via the LLM but skips all
+    SQL execution.  The serialised plan dict (containing SQL queries, check names,
+    and metric keys) is returned via XCom so you can inspect the generated SQL
+    before running it against production data.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection (schema introspection only;
+      no data is read).
+    """
+    LLMDataQualityOperator(
+        task_id="preview_orders_plan",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["orders"],
+        dry_run=True,
+        prompt_version="v1",
+        checks=[
+            DQCheckInput(
+                name="null_order_id",
+                description="Check the percentage of rows where order_id is NULL",
+            ),
+            DQCheckInput(
+                name="min_order_count",
+                description="Count the total number of rows in the orders table",
+            ),
+        ],
+    )
+
+
+# [END howto_operator_llm_dq_dry_run_preview]
+
+example_llm_dq_dry_run_preview()
+
+
+# [START howto_operator_llm_dq_custom_row_level]
+@dag
+def example_llm_dq_custom_row_level():
+    """
+    Run data-quality checks that include a custom row-level validator.
+
+    ``email_format_check`` is registered at module level with ``row_level=True``,
+    which instructs the LLM to generate a plain ``SELECT id, email FROM table``
+    query without aggregation.  The planner fetches up to ``row_level_sample_size``
+    rows and applies the regex validator per value, aggregating the result into a
+    :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`.
+
+    ``null_email`` uses a fixed ``null_pct_check`` validator.
+    ``min_customer_count`` has no fixed validator — the LLM selects one.
+
+    Use this pattern whenever per-row domain-specific validation logic cannot be
+    expressed as a single SQL aggregate metric.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection for the ``customers`` table.
+    """
+    LLMDataQualityOperator(
+        task_id="validate_customer_emails",
         llm_conn_id="pydanticai_default",
         db_conn_id="postgres_default",
         table_names=["customers"],
         prompt_version="v1",
         row_level_sample_size=100_000,
-        prompts={
-            "email_format": "Validate that the email column contains properly formatted email addresses",
-            "null_email": "Check the percentage of rows where email is NULL",
-        },
-        validators={
-            "email_format": email_format_check(max_invalid_pct=0.01),
-            "null_email": null_pct_check(max_pct=0.01),
-        },
+        checks=[
+            DQCheckInput(
+                name="email_format",
+                description="Validate that each email in the customers table is a properly formatted email address",
+                validator=email_format_check(max_invalid_pct=0.01),
+            ),
+            DQCheckInput(
+                name="null_email",
+                description="Check the percentage of rows where email is NULL",
+                validator=null_pct_check(max_pct=0.01),
+            ),
+            DQCheckInput(
+                name="min_customer_count",
+                description="Count the total number of rows in the customers table",
+            ),
+        ],
     )
 
 
-# [END howto_operator_llm_dq_custom_row_level_validator]
+# [END howto_operator_llm_dq_custom_row_level]
 
-example_llm_dq_custom_row_level_validator()
+example_llm_dq_custom_row_level()

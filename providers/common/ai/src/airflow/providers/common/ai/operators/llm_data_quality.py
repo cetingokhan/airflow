@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -27,15 +28,17 @@ from typing import TYPE_CHECKING, Any
 from airflow.providers.common.ai.operators.llm import LLMOperator
 from airflow.providers.common.ai.utils.db_schema import get_db_hook
 from airflow.providers.common.ai.utils.dq_models import (
+    DQCheck,
     DQCheckFailedError,
     DQCheckGroup,
+    DQCheckInput,
     DQCheckResult,
     DQPlan,
     DQReport,
     RowLevelResult,
     UnexpectedResult,
 )
-from airflow.providers.common.ai.utils.dq_validation import default_registry
+from airflow.providers.common.ai.utils.dq_validation import DQValidationToolset, default_registry
 from airflow.providers.common.compat.sdk import Variable
 
 try:
@@ -72,25 +75,38 @@ class LLMDataQualityOperator(LLMOperator):
     """
     Generate and execute data-quality checks from natural language descriptions.
 
-    Each entry in ``prompts`` describes **one** data-quality expectation.
-    The LLM groups related checks into optimised SQL queries, executes them
-    against the target database, and validates each metric against the
-    corresponding entry in ``validators``.  The task fails if any check
+    Each entry in ``checks`` describes **one** data-quality expectation.  The LLM
+    groups related checks into optimised SQL queries, selects the most appropriate
+    validator for each check from the registered catalog, executes the SQL against
+    the target database, and applies the validators.  The task fails if any check
     does not pass, gating downstream tasks on data quality.
 
-    Generated SQL plans are cached in Airflow
-    :class:`~airflow.models.variable.Variable` to avoid repeat LLM calls.
-    Set ``dry_run=True`` to preview the plan without executing it — the
-    serialised plan dict is returned without running any SQL.
-    Set ``require_approval=True`` to gate execution on human review via the
-    HITL interface: the plan is presented to the reviewer first, and SQL
-    checks run only after approval.  ``dry_run`` and ``require_approval``
-    are independent — enabling both returns the plan dict without any
-    approval prompt.
+    Optionally, supply a fixed ``validator`` on a :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput`
+    to bypass LLM validator selection for that specific check.
 
-    :param prompts: Mapping of ``{check_name: natural_language_description}``.
-        Each key must be unique.  Use one check per key; the operator enforces
-        a strict one-key → one-check mapping.
+    Generated SQL plans (including LLM-chosen validators) are cached in Airflow
+    :class:`~airflow.models.variable.Variable` to avoid repeat LLM calls.
+    Set ``dry_run=True`` to preview the plan without executing it.
+    Set ``require_approval=True`` to gate execution on human review via the
+    HITL interface.
+
+    :param checks: List of :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput`
+        objects (or plain dicts with ``name``, ``description``, and optional ``validator`` keys).
+        Each entry describes one data-quality expectation.  Names must be unique.
+        Example::
+
+            from airflow.providers.common.ai.utils.dq_models import DQCheckInput
+            from airflow.providers.common.ai.utils.dq_validation import null_pct_check
+
+            checks = [
+                DQCheckInput(name="email_nulls", description="Check for null email addresses"),
+                DQCheckInput(
+                    name="row_count",
+                    description="Ensure at least 1000 rows exist",
+                    validator=row_count_check(min_count=1000),  # fixed — LLM skips this one
+                ),
+            ]
+
     :param llm_conn_id: Connection ID for the LLM provider.
     :param model_id: Model identifier (e.g. ``"openai:gpt-4o"``).
         Overrides the model stored in the connection's extra field.
@@ -101,26 +117,14 @@ class LLMDataQualityOperator(LLMOperator):
         Must resolve to a :class:`~airflow.providers.common.sql.hooks.sql.DbApiHook`.
     :param table_names: Tables to include in the LLM's schema context.
     :param schema_context: Manual schema description; bypasses DB introspection.
-    :param validators: Mapping of ``{check_name: callable}`` where each callable
-        receives the raw metric value and returns ``True`` (pass) or ``False`` (fail).
-        Keys must be a subset of ``prompts.keys()``.
-        Use built-in factories from
-        :mod:`~airflow.providers.common.ai.utils.dq_validation` or plain lambdas::
-
-            from airflow.providers.common.ai.utils.dq_validation import null_pct_check
-
-            validators = {
-                "email_nulls": null_pct_check(max_pct=0.05),
-                "row_check": lambda v: v >= 1000,
-            }
-
     :param dialect: SQL dialect override (``postgres``, ``mysql``, etc.).
         Auto-detected from *db_conn_id* when not set.
     :param datasource_config: DataFusion datasource for object-storage schema.
     :param dry_run: When ``True``, generate and cache the plan but skip execution.
-        Returns the serialised plan dict instead of a :class:`~airflow.providers.common.ai.utils.dq_models.DQReport`.
+        Returns the serialised plan dict instead of a
+        :class:`~airflow.providers.common.ai.utils.dq_models.DQReport`.
     :param prompt_version: Optional version tag included in the plan cache key.
-        Bump this to invalidate cached plans when prompts change semantically
+        Bump this to invalidate cached plans when checks change semantically
         without changing their text.
     :param collect_unexpected: When ``True``, the LLM generates an
         ``unexpected_query`` for validity / string-format checks.
@@ -129,21 +133,19 @@ class LLMDataQualityOperator(LLMOperator):
     :param unexpected_sample_size: Maximum number of violating rows to return
         per failed check.  Default ``100``.
     :param row_level_sample_size: Maximum number of rows to fetch per row-level
-        check.  ``None`` (default) performs a full table scan — every row is
-        fetched and validated.  A positive integer is passed to the LLM as a
-        ``LIMIT`` clause on the generated SELECT, bounding execution time and
-        memory usage at the cost of sampling coverage.
+        check.  ``None`` (default) performs a full table scan.
     :param require_approval: When ``True``, the operator defers after generating
         and caching the DQ plan.  The plan SQL is surfaced in the HITL interface
-        for human review; checks run only after the reviewer approves.  Inherited
-        from :class:`~airflow.providers.common.ai.operators.llm.LLMOperator`.
-        ``dry_run=True`` takes precedence — combining both flags returns the plan
-        dict immediately without requesting approval.
+        for human review; checks run only after the reviewer approves.
+        ``dry_run=True`` takes precedence.
+
+    When approval is granted Airflow resumes the task by calling
+    :meth:`execute_complete` with the approved plan JSON.
     """
 
     template_fields: Sequence[str] = (
         *LLMOperator.template_fields,
-        "prompts",
+        "checks",
         "db_conn_id",
         "table_names",
         "schema_context",
@@ -156,11 +158,10 @@ class LLMDataQualityOperator(LLMOperator):
     def __init__(
         self,
         *,
-        prompts: dict[str, str],
+        checks: list[DQCheckInput | dict[str, Any]],
         db_conn_id: str | None = None,
         table_names: list[str] | None = None,
         schema_context: str | None = None,
-        validators: dict[str, Callable[[Any], bool]] | None = None,
         dialect: str | None = None,
         datasource_config: DataSourceConfig | None = None,
         prompt_version: str | None = None,
@@ -174,11 +175,12 @@ class LLMDataQualityOperator(LLMOperator):
         kwargs.setdefault("prompt", "LLMDataQualityOperator")
         super().__init__(**kwargs)
 
-        self.prompts = prompts
+        self.checks: list[DQCheckInput] = (
+            checks if not isinstance(checks, list) else [DQCheckInput.coerce(c) for c in checks]
+        )
         self.db_conn_id = db_conn_id
         self.table_names = table_names
         self.schema_context = schema_context
-        self.validators = validators or {}
         self.dialect = dialect
         self.datasource_config = datasource_config
         self.prompt_version = prompt_version
@@ -187,28 +189,24 @@ class LLMDataQualityOperator(LLMOperator):
         self.unexpected_sample_size = unexpected_sample_size
         self.row_level_sample_size = row_level_sample_size
 
-        self._validate_prompts()
-        self._validate_validator_keys()
+        self._validate_checks()
 
     def execute(self, context: Context) -> dict[str, Any]:
         """
         Generate the DQ plan (or load from cache), then execute or defer for approval.
+
+        The plan is generated with a single LLM call that simultaneously selects
+        validators from the registry **and** produces the SQL for each check.
+        Checks that have a user-supplied fixed validator bypass LLM selection.
 
         When ``dry_run=True`` the serialised plan dict is returned immediately —
         no SQL is executed and no approval is requested.
         When ``require_approval=True`` the task defers, presenting the plan to a
         human reviewer; data-quality checks run only after the reviewer approves.
 
-        :returns: Dict with keys ``plan``, ``passed``, and ``results``.  On success
-            ``passed=True`` and ``results`` is a list of per-check result dicts.
-            For row-level checks the ``value`` entry in each result dict is itself
-            a dict with keys ``total``, ``invalid``, ``invalid_pct``, and
-            ``sample_violations`` rather than a raw scalar.
-            When ``dry_run=True`` ``passed=None`` and ``results=None`` — no SQL
-            is executed.  The ``plan`` key is always present in all modes.
+        :returns: Dict with keys ``plan``, ``passed``, and ``results``.
         :raises DQCheckFailedError: If any data-quality check fails threshold validation.
-        :raises TaskDeferred: When ``require_approval=True``, defers for human review
-            before executing the checks.
+        :raises TaskDeferred: When ``require_approval=True``, defers for human review.
         """
         planner = self._build_planner()
 
@@ -236,7 +234,6 @@ class LLMDataQualityOperator(LLMOperator):
             return {"plan": plan.model_dump(), "passed": None, "results": None}
 
         if self.require_approval:
-            # Defer BEFORE execution — approval gates the SQL checks.
             self.defer_for_approval(  # type: ignore[misc]
                 context,
                 plan.model_dump_json(),
@@ -248,6 +245,7 @@ class LLMDataQualityOperator(LLMOperator):
 
     def _build_planner(self) -> SQLDQPlanner:
         """Construct a :class:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner` from operator config."""
+        fixed_validators = self._collect_fixed_validators()
         return SQLDQPlanner(
             llm_hook=self.llm_hook,
             db_hook=self.db_hook,
@@ -260,12 +258,14 @@ class LLMDataQualityOperator(LLMOperator):
             validator_contexts=self.validator_contexts,
             row_validators=self._collect_row_validators(),
             row_level_sample_size=self.row_level_sample_size,
+            fixed_validators=fixed_validators,
         )
 
     @cached_property
     def validator_contexts(self) -> str:
-        """Return validator-specific LLM context rendered from configured validators."""
-        return default_registry.build_llm_context(self.validators)
+        """Return validator-specific LLM context rendered from fixed validators only."""
+        fixed = self._collect_fixed_validators()
+        return default_registry.build_llm_context(fixed)
 
     def _run_checks_and_report(
         self,
@@ -278,10 +278,13 @@ class LLMDataQualityOperator(LLMOperator):
 
         :raises DQCheckFailedError: If any data-quality check fails.
         """
+        effective_validators = self._resolve_effective_validators_from_plan(plan)
+        planner.set_row_validators(
+            {name: fn for name, fn in effective_validators.items() if default_registry.is_row_level(fn)}
+        )
         results_map = planner.execute_plan(plan)
-        check_results = self._validate_results(results_map, plan)
+        check_results = self._validate_results(results_map, plan, effective_validators)
 
-        # Collect unexpected rows for failed validity/format checks.
         if self.collect_unexpected:
             failed_names = {r.check_name for r in check_results if not r.passed}
             if failed_names:
@@ -297,18 +300,7 @@ class LLMDataQualityOperator(LLMOperator):
                 {
                     "check_name": r.check_name,
                     "metric_key": r.metric_key,
-                    # RowLevelResult is not JSON-serialisable; convert to a plain dict.
-                    "value": (
-                        {
-                            "total": r.value.total,
-                            "invalid": r.value.invalid,
-                            "invalid_pct": r.value.invalid_pct,
-                            "sample_violations": r.value.sample_violations,
-                            "sample_size": r.value.sample_size,
-                        }
-                        if isinstance(r.value, RowLevelResult)
-                        else r.value
-                    ),
+                    "value": r.value.to_dict() if isinstance(r.value, RowLevelResult) else r.value,
                     "passed": r.passed,
                     "failure_reason": r.failure_reason,
                     **(
@@ -394,12 +386,13 @@ class LLMDataQualityOperator(LLMOperator):
         lines: list[str] = [
             f"### `{group.group_id}`",
             "",
-            "| Check name | Metric key | Category |",
-            "|---|---|---|",
+            "| Check name | Metric key | Category | Validator |",
+            "|---|---|---|---|",
         ]
         for check in group.checks:
             category = check.check_category or "—"
-            lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {category} |")
+            validator_label = self._describe_validator_for_check(check)
+            lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {category} | {validator_label} |")
 
         lines += [
             "",
@@ -428,14 +421,15 @@ class LLMDataQualityOperator(LLMOperator):
 
     def _render_row_level_group(self, group: DQCheckGroup) -> list[str]:
         """Render one row-level group as a markdown subsection with threshold info."""
+        all_validators = self._resolve_effective_validators()
         lines: list[str] = [
             f"### `{group.group_id}`",
             "",
-            "| Check name | Metric key | Max invalid % |",
-            "|---|---|---|",
+            "| Check name | Metric key | Max invalid % | Validator |",
+            "|---|---|---|---|",
         ]
         for check in group.checks:
-            validator = self.validators.get(check.check_name)
+            validator = all_validators.get(check.check_name)
             max_pct = (
                 self._resolve_row_level_max_invalid_pct(
                     check.check_name,
@@ -447,7 +441,10 @@ class LLMDataQualityOperator(LLMOperator):
                 else None
             )
             threshold_str = f"{max_pct:.2%}" if max_pct is not None else "—"
-            lines.append(f"| `{check.check_name}` | `{check.metric_key}` | {threshold_str} |")
+            validator_label = self._describe_validator_for_check(check)
+            lines.append(
+                f"| `{check.check_name}` | `{check.metric_key}` | {threshold_str} | {validator_label} |"
+            )
 
         lines += [
             "",
@@ -458,15 +455,27 @@ class LLMDataQualityOperator(LLMOperator):
         ]
         return lines
 
+    def _describe_validator_for_check(self, check: DQCheck) -> str:
+        """Return a human-readable validator label for display in the HITL markdown."""
+        if check.validator_name is None:
+            fixed = self._collect_fixed_validators()
+            if check.check_name in fixed:
+                return f"*(fixed)* `{_describe_validator(fixed[check.check_name])}`"
+            return "*(none)*"
+        if check.validator_name.lower() == "none":
+            return "*(none)*"
+        args_str = ", ".join(f"{k}={v!r}" for k, v in sorted(check.validator_args.items()))
+        return f"`{check.validator_name}({args_str})`"
+
     def _load_or_generate_plan(self, planner: SQLDQPlanner, schema_ctx: str) -> DQPlan:
         """Return a cached plan when available, otherwise generate and cache a new one."""
-        if not isinstance(self.prompts, dict):
-            raise TypeError("prompts must be a dict[str, str] before generating a DQ plan.")
+        if not isinstance(self.checks, list):
+            raise TypeError("checks must be a list[DQCheckInput] before generating a DQ plan.")
 
         row_validator_thresholds = self._collect_row_validator_thresholds()
-
+        catalog_hash = planner.build_catalog_hash()
         plan_hash = _compute_plan_hash(
-            self.prompts,
+            self.checks,
             self.prompt_version,
             self.collect_unexpected,
             self.row_level_sample_size,
@@ -474,6 +483,7 @@ class LLMDataQualityOperator(LLMOperator):
             unexpected_sample_size=self.unexpected_sample_size,
             validator_contexts=self.validator_contexts,
             row_validator_thresholds=row_validator_thresholds,
+            catalog_hash=catalog_hash,
         )
         variable_key = f"{_PLAN_VARIABLE_PREFIX}{plan_hash}"
 
@@ -486,7 +496,7 @@ class LLMDataQualityOperator(LLMOperator):
             return plan
 
         self.log.info("DQ plan cache miss — generating via LLM (key: %r).", variable_key)
-        plan = planner.generate_plan(self.prompts, schema_ctx)
+        plan = planner.generate_plan(self.checks, schema_ctx)
         plan.plan_hash = plan_hash
         Variable.set(variable_key, plan.model_dump_json())
         return plan
@@ -522,28 +532,18 @@ class LLMDataQualityOperator(LLMOperator):
         self,
         results_map: dict[str, Any],
         plan: DQPlan,
+        effective_validators: dict[str, Callable[[Any], bool]],
     ) -> list[DQCheckResult]:
         """
         Apply validators to each metric value and return per-check results.
 
-        For aggregate checks each validator callable receives the raw metric
-        value returned by the database.  For row-level checks, where *value* is
-        a :class:`~airflow.providers.common.ai.utils.dq_models.RowLevelResult`,
-        the pass/fail decision compares ``invalid_pct`` against the validator's
-        ``_max_invalid_pct`` attribute (defaulting to ``0.0`` when absent).
-        Aggregate checks without a registered validator are logged and marked
-        as passed; row-level checks require an explicit validator and fail
-        when none is provided.
-
-        :param results_map: ``{check_name: metric_value_or_RowLevelResult}`` as
-            returned by
-            :meth:`~airflow.providers.common.ai.utils.dq_planner.SQLDQPlanner.execute_plan`.
-        :param plan: The DQ plan whose groups and checks drive iteration order.
-        :returns: Per-check
-            :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckResult`
-            list in plan-group order.
-        :raises ValueError: If *results_map* is missing a key for any check in *plan*.
+        *effective_validators* must be pre-built by
+        :meth:`_resolve_effective_validators_from_plan` so that both user-fixed
+        and LLM-suggested validators are present.  When no validator is found
+        for an aggregate check it is logged and marked passed by default;
+        row-level checks without a validator are marked failed.
         """
+        all_validators = effective_validators
         check_results: list[DQCheckResult] = []
 
         for group in plan.groups:
@@ -554,7 +554,7 @@ class LLMDataQualityOperator(LLMOperator):
                         f"(group {group.group_id!r}). Available keys: {sorted(results_map)}"
                     )
                 value = results_map[check.check_name]
-                validator = self.validators.get(check.check_name)
+                validator = all_validators.get(check.check_name)
 
                 passed = True
                 failure_reason: str | None = None
@@ -614,8 +614,9 @@ class LLMDataQualityOperator(LLMOperator):
         return check_results
 
     def _collect_row_validators(self) -> dict[str, Callable[[Any], bool]]:
-        """Return the subset of validators that are row-level."""
-        return {name: fn for name, fn in self.validators.items() if default_registry.is_row_level(fn)}
+        """Return the subset of effective validators that are row-level."""
+        all_validators = self._resolve_effective_validators()
+        return {name: fn for name, fn in all_validators.items() if default_registry.is_row_level(fn)}
 
     def _collect_row_validator_thresholds(self) -> dict[str, float | str | None]:
         """Return a deterministic ``{check_name: threshold}`` map for row-level validators."""
@@ -630,6 +631,10 @@ class LLMDataQualityOperator(LLMOperator):
                 thresholds[name] = str(raw_threshold)
         return thresholds
 
+    def _collect_fixed_validators(self) -> dict[str, Callable[[Any], bool]]:
+        """Return ``{check_name: callable}`` for checks that have a user-supplied fixed validator."""
+        return {check.name: check.validator for check in self.checks if check.validator is not None}
+
     @staticmethod
     def _attach_unexpected(
         check_results: list[DQCheckResult],
@@ -641,32 +646,75 @@ class LLMDataQualityOperator(LLMOperator):
             if unexpected is not None:
                 result.unexpected = unexpected
 
-    def _validate_validator_keys(self) -> None:
+    def _validate_checks(self) -> None:
         """
-        Raise :class:`ValueError` if any validator key is absent from *prompts*.
+        Raise :class:`ValueError` when *checks* is empty or contains invalid entries.
 
-        Skips validation when *prompts* is not yet a dict — this happens when the
-        operator is constructed via the ``@task.llm_dq`` decorator and *prompts*
-        is set to ``SET_DURING_EXECUTION`` at init time.  The decorator calls this
-        method again after the callable has populated ``self.prompts``.
+        Skips validation when *checks* is not yet a list — this happens when the
+        operator is constructed via the ``@task.llm_dq`` decorator.
         """
-        if not isinstance(self.prompts, dict):
+        if not isinstance(self.checks, list):
             return
-        unknown = set(self.validators.keys()) - set(self.prompts.keys())
-        if unknown:
+        if not self.checks:
+            raise ValueError("checks must not be empty. Provide at least one DQCheckInput.")
+        names = [c.name for c in self.checks]
+        duplicates = sorted(name for name, cnt in Counter(names).items() if cnt > 1)
+        if duplicates:
             raise ValueError(
-                f"validators contains keys that are not present in prompts: {sorted(unknown)}. "
-                "Every validator key must correspond to a prompt key."
+                f"checks contains duplicate name(s): {duplicates}. Each check name must be unique."
             )
 
-    def _validate_prompts(self) -> None:
+    def _resolve_effective_validators(self) -> dict[str, Callable[[Any], bool]]:
         """
-        Raise :class:`ValueError` if *prompts* is an empty dict.
+        Return ``{check_name: callable}`` for all checks that have a user-supplied fixed validator.
 
-        Skips validation when *prompts* is not yet a dict (decorator use-case).
+        This is the base layer of validator resolution.  To also incorporate
+        LLM-suggested validators from a generated plan, call
+        :meth:`_resolve_effective_validators_from_plan`.
         """
-        if isinstance(self.prompts, dict) and not self.prompts:
-            raise ValueError("prompts must not be empty. Provide at least one check_name → description pair.")
+        validators: dict[str, Callable[[Any], bool]] = {}
+
+        for check in self.checks:
+            if check.validator is not None:
+                validators[check.name] = check.validator
+
+        return validators
+
+    def _resolve_effective_validators_from_plan(
+        self,
+        plan: DQPlan,
+        toolset: DQValidationToolset | None = None,
+    ) -> dict[str, Callable[[Any], bool]]:
+        """
+        Return effective validators augmented with LLM-suggested ones from *plan*.
+
+        Fixed validators take precedence; LLM-suggested validators fill in the rest.
+
+        :param toolset: Toolset to use for LLM-suggested validator instantiation.
+            When ``None`` the operator's own planner toolset is not reused here,
+            so callers that already have a toolset should pass it to avoid
+            creating an extra instance.
+        """
+        validators = self._resolve_effective_validators()
+        _toolset = toolset if toolset is not None else DQValidationToolset()
+
+        for group in plan.groups:
+            for check in group.checks:
+                if check.check_name in validators:
+                    continue
+                if check.validator_name and check.validator_name.lower() != "none":
+                    try:
+                        validators[check.check_name] = _toolset.instantiate(
+                            check.validator_name, check.validator_args
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            "Failed to instantiate LLM-suggested validator "
+                            f"{check.validator_name!r} for check {check.check_name!r} "
+                            f"with args {check.validator_args!r}: {exc}"
+                        ) from exc
+
+        return validators
 
     @cached_property
     def db_hook(self) -> DbApiHook | None:
@@ -701,7 +749,7 @@ class LLMDataQualityOperator(LLMOperator):
 
 
 def _compute_plan_hash(
-    prompts: dict[str, str],
+    checks: list[DQCheckInput],
     prompt_version: str | None,
     collect_unexpected: bool = False,
     row_level_sample_size: int | None = None,
@@ -709,21 +757,21 @@ def _compute_plan_hash(
     unexpected_sample_size: int = 100,
     validator_contexts: str = "",
     row_validator_thresholds: dict[str, float | str | None] | None = None,
+    catalog_hash: str = "",
 ) -> str:
     """
     Return a short, stable hash of the inputs that determine a unique DQ plan.
 
-    Includes *prompts*, *prompt_version*, *collect_unexpected*,
-    *row_level_sample_size*, *schema_context*, *unexpected_sample_size*,
-    *validator_contexts*, and *row_validator_thresholds*.
     Sorted serialisation ensures the hash is order-independent.
     The result is prefixed with the version tag so cache keys are human-readable.
     """
-    payload = json.dumps(sorted(prompts.items()), sort_keys=True)
+    payload = json.dumps(sorted((c.name, c.description) for c in checks))
     if schema_context:
         payload += f":schema={hashlib.sha256(schema_context.encode()).hexdigest()[:16]}"
     if validator_contexts:
         payload += f":validator_contexts={hashlib.sha256(validator_contexts.encode()).hexdigest()[:16]}"
+    if catalog_hash:
+        payload += f":catalog={catalog_hash}"
     if row_validator_thresholds:
         payload += ":row_thresholds=" + json.dumps(
             row_validator_thresholds, sort_keys=True, separators=(",", ":")

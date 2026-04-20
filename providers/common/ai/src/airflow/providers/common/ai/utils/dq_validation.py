@@ -17,37 +17,40 @@
 """
 Built-in and custom validator factories for :class:`~airflow.providers.common.ai.operators.llm_data_quality.LLMDataQualityOperator`.
 
-Each factory returns a ``Callable[[Any], bool]`` that can be placed directly in the
-``validators`` dict alongside plain lambdas.  They are intentionally decoupled from
-the operator so they can be tested and composed independently.
+Each factory returns a ``Callable[[Any], bool]`` and can be passed as the
+``validator`` argument of a :class:`~airflow.providers.common.ai.utils.dq_models.DQCheckInput`
+to force a specific validator for that check, bypassing LLM selection.
+Factories are intentionally decoupled from the operator so they can be tested and
+composed independently.
 
-Custom validators can be registered with :func:`register_validator` so that the
-operator automatically injects their ``llm_context`` into the LLM system prompt,
-guiding SQL generation for custom metric types.
+Custom validators registered with :func:`register_validator` are exposed to the LLM
+via the validator catalog so the model can select them automatically.
 
 Usage::
 
+    from airflow.providers.common.ai.utils.dq_models import DQCheckInput
     from airflow.providers.common.ai.utils.dq_validation import (
         null_pct_check,
         row_count_check,
-        duplicate_pct_check,
-        between_check,
-        exact_check,
         register_validator,
     )
 
-    # Built-in validators
-    validators = {
-        "email_nulls": null_pct_check(max_pct=0.05),
-        "min_customers": row_count_check(min_count=1000),
-        "dup_emails": duplicate_pct_check(max_pct=0.01),
-        "amount_range": between_check(min_val=0.0, max_val=1_000_000.0),
-        "active_flag": exact_check(expected=0),
-        "negative_rev": lambda v: v == 0,
-    }
+    # Fixed validators — LLM is not asked to select a validator for these checks.
+    checks = [
+        DQCheckInput(
+            name="email_nulls",
+            description="Check for null emails",
+            validator=null_pct_check(max_pct=0.05),
+        ),
+        DQCheckInput(
+            name="min_customers",
+            description="Ensure at least 1000 rows",
+            validator=row_count_check(min_count=1000),
+        ),
+    ]
 
 
-    # Custom validator with LLM context
+    # Custom validator with LLM context — LLM can select this automatically.
     @register_validator(
         "freshness_check",
         llm_context=(
@@ -66,13 +69,14 @@ Usage::
 
 from __future__ import annotations
 
+import functools
+import inspect
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-# ------------------------------------------------------------------
-# Validator registry — allows custom validators with LLM context
-# ------------------------------------------------------------------
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,7 @@ class ValidatorRegistry:
         ) -> Callable[..., Callable[[Any], bool]]:
             # Wrap the factory so every closure it returns carries introspection
             # attributes used by the operator and planner.
+            @functools.wraps(factory)
             def _wrapped_factory(*args: Any, **kwargs: Any) -> Callable[[Any], bool]:
                 closure = factory(*args, **kwargs)
                 arg_parts = [repr(a) for a in args]
@@ -338,11 +343,6 @@ def register_validator(
     )
 
 
-# ------------------------------------------------------------------
-# Built-in validator factories
-# ------------------------------------------------------------------
-
-
 @register_validator(
     "null_pct_check",
     llm_context="Returns null percentage as a float between 0.0 and 1.0. SQL pattern: COUNT(CASE WHEN col IS NULL THEN 1 END) * 1.0 / COUNT(*).",
@@ -466,3 +466,167 @@ def exact_check(*, expected: Any) -> Callable[[Any], bool]:
         return value == expected
 
     return _check
+
+
+class DQValidationToolset:
+    """
+    Validator catalog manager that exposes registered validators to the LLM.
+
+    Serves two purposes:
+
+    1. **Prompt generation** — :meth:`build_system_prompt_section` produces a
+       text block that is injected into the LLM system prompt so the model knows
+       which validators are available, their parameters, and what SQL metric each
+       one expects.
+
+    2. **Suggestion validation** — :meth:`validate_suggestion` verifies that the
+       name and arguments proposed by the LLM can actually instantiate a callable
+       without error, before the plan is accepted.
+
+    :param registry: Validator registry to expose.  Defaults to
+        :data:`default_registry`.
+    """
+
+    def __init__(self, registry: ValidatorRegistry | None = None) -> None:
+        self._registry: ValidatorRegistry = registry if registry is not None else default_registry
+
+    def build_system_prompt_section(self) -> str:
+        """
+        Return a system-prompt block listing all registered validators.
+
+        The block is appended to the SQL-planning prompt and tells the LLM
+        which validators exist, their parameter signatures, and what SQL
+        metric each one expects.  The LLM fills ``validator_name`` and
+        ``validator_args`` on each :class:`~airflow.providers.common.ai.utils.dq_models.DQCheck`
+        based on this catalogue.
+        """
+        lines: list[str] = [
+            "",
+            "AVAILABLE VALIDATORS:",
+            "  For each DQCheck, select the most appropriate validator from the list below.",
+            "  Fill the validator_name field with the exact name and validator_args with the",
+            "  required keyword arguments as a JSON object.",
+            '  If no validator is appropriate for a check, set validator_name to "none".',
+            "  If the check has a [FIXED VALIDATOR] annotation, leave validator_name as null.",
+            "",
+        ]
+
+        aggregate_entries: list[str] = []
+        row_level_entries: list[str] = []
+
+        for name in self._registry.list_validators():
+            entry = self._registry.get(name)
+            sig_str = self._format_signature(entry.factory)
+            category = entry.check_category or "—"
+            block = (
+                f'  - name: "{name}"\n'
+                f"    category: {category}\n"
+                f"    row_level: {str(entry.row_level).lower()}\n"
+                f"    parameters: {sig_str}\n"
+                f"    description: {entry.llm_context or '(no description)'}"
+            )
+            if entry.row_level:
+                row_level_entries.append(block)
+            else:
+                aggregate_entries.append(block)
+
+        if aggregate_entries:
+            lines.append("  Aggregate validators (SQL returns a single scalar metric):")
+            lines.extend(aggregate_entries)
+            lines.append("")
+
+        if row_level_entries:
+            lines.append("  Row-level validators (SQL returns raw column values per row, no aggregation):")
+            lines.extend(row_level_entries)
+            lines.append("")
+
+        lines += [
+            "  IMPORTANT: validator_args must contain ONLY the keyword argument names shown",
+            "  above — no extra keys, no positional args.  The argument values must match the",
+            "  expected Python types (float, int, etc.).",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def validate_suggestion(
+        self,
+        check_name: str,
+        validator_name: str,
+        validator_args: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """
+        Verify that *validator_name* exists and can be instantiated with *validator_args*.
+
+        :param check_name: The check this suggestion belongs to (used in error messages).
+        :param validator_name: Name of the validator factory as registered.
+        :param validator_args: Keyword arguments to pass to the factory.
+        :returns: ``(True, "")`` on success; ``(False, error_message)`` on failure.
+        """
+        if not validator_name or validator_name.lower() == "none":
+            return False, (
+                f"Check {check_name!r}: LLM did not suggest a validator (validator_name is null or 'none')."
+            )
+
+        try:
+            entry = self._registry.get(validator_name)
+        except KeyError:
+            available = self._registry.list_validators()
+            return False, (
+                f"Check {check_name!r}: validator {validator_name!r} is not registered. "
+                f"Available validators: {available}"
+            )
+
+        # Validate argument names against the factory signature.
+        sig = inspect.signature(entry.factory)
+        invalid_args = [k for k in validator_args if k not in sig.parameters]
+        if invalid_args:
+            valid_params = [p for p in sig.parameters if p != "self"]
+            return False, (
+                f"Check {check_name!r}: validator {validator_name!r} received unknown "
+                f"argument(s) {invalid_args}. Valid parameters: {valid_params}"
+            )
+
+        # Try to instantiate the validator to catch type errors early.
+        try:
+            entry.factory(**validator_args)
+        except Exception as exc:
+            return False, (
+                f"Check {check_name!r}: failed to instantiate validator {validator_name!r} "
+                f"with args {validator_args!r}: {exc}"
+            )
+
+        return True, ""
+
+    def instantiate(self, validator_name: str, validator_args: dict[str, Any]) -> Callable[[Any], bool]:
+        """
+        Instantiate and return the validator callable for *validator_name*.
+
+        :param validator_name: Registered validator factory name.
+        :param validator_args: Keyword arguments for the factory.
+        :raises KeyError: If *validator_name* is not registered.
+        :raises Exception: If the factory raises during instantiation.
+        """
+        entry = self._registry.get(validator_name)
+        return entry.factory(**validator_args)
+
+    @staticmethod
+    def _format_signature(factory: Callable[..., Any]) -> str:
+        """Return a compact human-readable parameter list for a validator factory."""
+        try:
+            sig = inspect.signature(factory)
+        except (ValueError, TypeError):
+            return "(unknown)"
+        parts: list[str] = []
+        for name, param in sig.parameters.items():
+            if name == "self":
+                continue
+            annotation = (
+                param.annotation.__name__
+                if isinstance(param.annotation, type)
+                else (str(param.annotation) if param.annotation is not inspect.Parameter.empty else "Any")
+            )
+            if param.default is inspect.Parameter.empty:
+                parts.append(f"{name}: {annotation}")
+            else:
+                parts.append(f"{name}: {annotation} = {param.default!r}")
+        return "(" + ", ".join(parts) + ")" if parts else "(no parameters)"
