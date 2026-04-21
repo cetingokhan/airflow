@@ -553,19 +553,34 @@ class DQValidationToolset:
         check_name: str,
         validator_name: str,
         validator_args: dict[str, Any],
+        check_category: str = "",
     ) -> tuple[bool, str]:
         """
         Verify that *validator_name* exists and can be instantiated with *validator_args*.
 
+        For aggregate checks, ``"none"`` or an empty *validator_name* is valid — the
+        LLM is explicitly instructed to set ``"none"`` when no validator fits, and the
+        operator marks such checks as passed by default.  Row-level checks (``check_category
+        == "row_level"``) must always have a registered validator, so an empty/``"none"``
+        value is treated as an error for them.
+
         :param check_name: The check this suggestion belongs to (used in error messages).
         :param validator_name: Name of the validator factory as registered.
         :param validator_args: Keyword arguments to pass to the factory.
+        :param check_category: Semantic category of the check (e.g. ``"row_level"``,
+            ``"null_check"``, etc.).  Used to decide whether a missing validator is
+            acceptable.
         :returns: ``(True, "")`` on success; ``(False, error_message)`` on failure.
         """
         if not validator_name or validator_name.lower() == "none":
-            return False, (
-                f"Check {check_name!r}: LLM did not suggest a validator (validator_name is null or 'none')."
-            )
+            if check_category == "row_level":
+                return False, (
+                    f"Check {check_name!r}: row-level checks must have a registered validator "
+                    f"(validator_name is null or 'none')."
+                )
+            # Aggregate checks may legitimately have no validator; the operator marks
+            # them as passed and still collects the metric.
+            return True, ""
 
         try:
             entry = self._registry.get(validator_name)

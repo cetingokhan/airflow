@@ -488,19 +488,20 @@ class SQLDQPlanner:
         Return a ``{check_name: error_message}`` dict for every invalid validator suggestion.
 
         Checks with user-fixed validators are excluded from validation.
+        Aggregate checks may legitimately have no validator (``validator_name`` is ``None``
+        or ``"none"``); only row-level checks must always have a registered validator.
         """
         errors: dict[str, str] = {}
         for group in plan.groups:
             for check in group.checks:
                 if check.check_name in self._fixed_validators:
                     continue
-                # For non-fixed checks, missing validator_name is invalid and must
-                # trigger correction/failure.
                 suggested_name = check.validator_name or ""
                 ok, msg = self._toolset.validate_suggestion(
                     check.check_name,
                     suggested_name,
                     check.validator_args,
+                    check_category=check.check_category,
                 )
                 if not ok:
                     errors[check.check_name] = msg

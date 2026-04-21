@@ -94,7 +94,10 @@ class _LLMDQDecoratedOperator(DecoratedOperator, LLMDataQualityOperator):
                 "The returned value from the @task.llm_dq callable must be a non-empty list[DQCheckInput]."
             )
 
-        self.checks = checks
+        from airflow.providers.common.ai.utils.dq_models import DQCheckInput
+
+        self.checks = [DQCheckInput.coerce(c) for c in checks]
+        self._validate_checks()
         self.render_template_fields(context)
         return LLMDataQualityOperator.execute(self, context)
 

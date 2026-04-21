@@ -445,6 +445,14 @@ class LLMDataQualityOperator(LLMOperator):
                 if validator is not None
                 else None
             )
+            if max_pct is None:
+                # Fall back to validator_args from the plan (LLM-suggested validators).
+                raw = check.validator_args.get("max_invalid_pct")
+                if raw is not None:
+                    try:
+                        max_pct = float(raw)
+                    except (TypeError, ValueError):
+                        pass
             threshold_str = f"{max_pct:.2%}" if max_pct is not None else "—"
             validator_label = self._describe_validator_for_check(check)
             lines.append(

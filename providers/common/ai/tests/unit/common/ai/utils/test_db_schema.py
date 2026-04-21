@@ -26,7 +26,7 @@ from airflow.providers.common.sql.hooks.sql import DbApiHook
 
 class TestBuildSchemaContext:
     def test_raises_when_table_names_given_without_db_hook(self):
-        with pytest.raises(ValueError, match="table_names requires db_conn_id"):
+        with pytest.raises(ValueError, match="table_names were provided but db_hook is None"):
             build_schema_context(
                 db_hook=None,
                 table_names=["customers"],

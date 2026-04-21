@@ -303,6 +303,65 @@ def example_llm_dq_dry_run_preview():
 example_llm_dq_dry_run_preview()
 
 
+# [START howto_operator_llm_dq_with_human_approval]
+@dag
+def example_llm_dq_with_human_approval():
+    """
+    Three-step pipeline: dry-run plan generation → human approval → execution.
+
+    The first task generates and caches the SQL plan with ``dry_run=True``.
+    An ``ApprovalOperator`` gates execution so a reviewer can inspect the
+    generated SQL before it touches production data.  The second
+    ``LLMDataQualityOperator`` reuses the cached plan (same ``prompt_version``
+    and checks) and executes the actual data-quality queries.
+
+    Connections required:
+
+    - ``pydanticai_default``: Pydantic AI connection.
+    - ``postgres_default``: PostgreSQL connection for the ``orders`` table.
+    """
+    from airflow.providers.standard.operators.hitl import ApprovalOperator
+
+    checks = [
+        DQCheckInput(
+            name="null_order_id",
+            description="Check the percentage of rows where order_id is NULL",
+        ),
+        DQCheckInput(
+            name="min_order_count",
+            description="Count the total number of rows in the orders table",
+        ),
+    ]
+
+    generate_plan = LLMDataQualityOperator(
+        task_id="generate_plan",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["orders"],
+        dry_run=True,
+        prompt_version="v1",
+        checks=checks,
+    )
+
+    approve = ApprovalOperator(task_id="approve_plan")
+
+    execute_checks = LLMDataQualityOperator(
+        task_id="execute_checks",
+        llm_conn_id="pydanticai_default",
+        db_conn_id="postgres_default",
+        table_names=["orders"],
+        prompt_version="v1",
+        checks=checks,
+    )
+
+    generate_plan >> approve >> execute_checks
+
+
+# [END howto_operator_llm_dq_with_human_approval]
+
+example_llm_dq_with_human_approval()
+
+
 # [START howto_operator_llm_dq_custom_row_level]
 @dag
 def example_llm_dq_custom_row_level():

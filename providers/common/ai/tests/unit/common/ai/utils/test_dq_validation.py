@@ -527,17 +527,30 @@ class TestDQValidationToolset:
         assert ok is False
         assert "wrong_key" in msg
 
-    def test_none_validator_name_returns_false(self):
+    def test_empty_validator_name_is_valid_for_aggregate_check(self):
         toolset = DQValidationToolset(registry=self._make_registry())
-        # Empty string
+        # Aggregate checks may have no validator — LLM is instructed to use "none".
         ok, msg = toolset.validate_suggestion("my_check", "", {})
-        assert ok is False
+        assert ok is True
+        assert msg == ""
 
-    def test_none_string_validator_name_returns_false(self):
+    def test_none_string_validator_name_is_valid_for_aggregate_check(self):
         toolset = DQValidationToolset(registry=self._make_registry())
         ok, msg = toolset.validate_suggestion("my_check", "none", {})
+        assert ok is True
+        assert msg == ""
+
+    def test_empty_validator_name_is_invalid_for_row_level_check(self):
+        toolset = DQValidationToolset(registry=self._make_registry())
+        ok, msg = toolset.validate_suggestion("my_check", "", {}, check_category="row_level")
         assert ok is False
-        assert "none" in msg.lower() or "null" in msg.lower()
+        assert "row-level" in msg.lower()
+
+    def test_none_string_validator_name_is_invalid_for_row_level_check(self):
+        toolset = DQValidationToolset(registry=self._make_registry())
+        ok, msg = toolset.validate_suggestion("my_check", "none", {}, check_category="row_level")
+        assert ok is False
+        assert "row-level" in msg.lower()
 
     def test_wrong_type_for_arg_returns_false(self):
         toolset = DQValidationToolset(registry=self._make_registry())

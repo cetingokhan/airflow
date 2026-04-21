@@ -212,6 +212,7 @@ cas
 Cassandra
 cassandra
 casted
+catalogue
 Catchup
 catchup
 ccache

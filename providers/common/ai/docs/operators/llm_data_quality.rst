@@ -122,8 +122,8 @@ that returns the metric format your validator expects:
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
     :language: python
-    :start-after: [START howto_operator_llm_dq_custom_validator]
-    :end-before: [END howto_operator_llm_dq_custom_validator]
+    :start-after: [START howto_operator_llm_dq_email_format_validator]
+    :end-before: [END howto_operator_llm_dq_email_format_validator]
 
 With Schema Introspection
 -------------------------
@@ -210,8 +210,8 @@ in the schema context.
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
     :language: python
-    :start-after: [START howto_operator_llm_dq_s3_parquet]
-    :end-before: [END howto_operator_llm_dq_s3_parquet]
+    :start-after: [START howto_operator_llm_dq_datafusion_classic]
+    :end-before: [END howto_operator_llm_dq_datafusion_classic]
 
 Row-Level Checks
 ----------------
@@ -300,8 +300,8 @@ Example
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
     :language: python
-    :start-after: [START howto_operator_llm_dq_custom_row_level_validator]
-    :end-before: [END howto_operator_llm_dq_custom_row_level_validator]
+    :start-after: [START howto_operator_llm_dq_custom_row_level]
+    :end-before: [END howto_operator_llm_dq_custom_row_level]
 
 Plan Caching
 ------------
@@ -357,8 +357,8 @@ before running against production data:
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
     :language: python
-    :start-after: [START howto_operator_llm_dq_dry_run_standalone]
-    :end-before: [END howto_operator_llm_dq_dry_run_standalone]
+    :start-after: [START howto_operator_llm_dq_dry_run_preview]
+    :end-before: [END howto_operator_llm_dq_dry_run_preview]
 
 You can also combine ``dry_run=True`` with
 :class:`~airflow.providers.standard.operators.hitl.ApprovalOperator` to build
@@ -417,8 +417,8 @@ A full runnable example:
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_data_quality.py
     :language: python
-    :start-after: [START howto_operator_llm_dq_require_approval_builtin]
-    :end-before: [END howto_operator_llm_dq_require_approval_builtin]
+    :start-after: [START howto_operator_llm_dq_simple_builtin_approval]
+    :end-before: [END howto_operator_llm_dq_simple_builtin_approval]
 
 See :class:`~airflow.providers.common.ai.operators.llm.LLMOperator` for the
 full set of HITL parameters (``require_approval``, ``approval_timeout``,

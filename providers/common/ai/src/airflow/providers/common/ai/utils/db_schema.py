@@ -101,10 +101,18 @@ def build_schema_context(
     :param table_names: Table names to introspect via *db_hook*.
     :param schema_context: Manual schema description; bypasses introspection when set.
     :param datasource_config: DataFusion datasource config for object-storage schema.
-    :raises ValueError: If *table_names* are provided but none yield schema information.
+    :raises ValueError: If *table_names* are provided but *db_hook* is ``None`` (and
+        *schema_context* is not set), or if *table_names* are provided but none yield
+        schema information.
     """
     if schema_context:
         return schema_context
+
+    if table_names and not db_hook:
+        raise ValueError(
+            "table_names were provided but db_hook is None. "
+            "Either supply a db_hook for schema introspection or pass schema_context directly."
+        )
 
     if (db_hook and table_names) or datasource_config:
         return _introspect_schemas(
