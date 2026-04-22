@@ -1480,6 +1480,7 @@ class TestSQLDQPlannerValidatorSelectionValidation:
                             check_name="null_emails",
                             metric_key="null_email_count",
                             group_id="g",
+                            check_category="row_level",
                             validator_name=None,
                             validator_args={},
                         )
@@ -1505,6 +1506,7 @@ class TestSQLDQPlannerValidatorSelectionValidation:
                             check_name="null_emails",
                             metric_key="null_email_count",
                             group_id="g",
+                            check_category="row_level",
                             validator_name="none",
                             validator_args={},
                         )
@@ -1517,6 +1519,33 @@ class TestSQLDQPlannerValidatorSelectionValidation:
 
         with pytest.raises(ValueError, match="validator_name is null or 'none'"):
             planner.generate_plan(checks, schema_context="")
+
+    def test_aggregate_check_with_none_validator_is_accepted(self):
+        """Aggregate checks may have no validator — 'none' is a valid pass-through."""
+        checks = _make_checks("null_emails")
+        plan = DQPlan(
+            groups=[
+                DQCheckGroup(
+                    group_id="g",
+                    query="SELECT COUNT(*) AS null_email_count FROM t",
+                    checks=[
+                        DQCheck(
+                            check_name="null_emails",
+                            metric_key="null_email_count",
+                            group_id="g",
+                            check_category="null_check",
+                            validator_name=None,
+                            validator_args={},
+                        )
+                    ],
+                )
+            ]
+        )
+        mock_hook = _make_llm_hook(plan)
+        planner = SQLDQPlanner(llm_hook=mock_hook, db_hook=None, max_validator_retries=1)
+
+        result = planner.generate_plan(checks, schema_context="")
+        assert result.check_names == ["null_emails"]
 
     def test_fixed_validator_check_can_keep_null_validator_name(self):
         checks = _make_checks("null_emails")
