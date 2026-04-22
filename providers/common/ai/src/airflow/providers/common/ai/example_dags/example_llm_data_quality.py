@@ -343,7 +343,7 @@ def example_llm_dq_with_human_approval():
         checks=checks,
     )
 
-    approve = ApprovalOperator(task_id="approve_plan")
+    approve = ApprovalOperator(task_id="approve_plan", subject="Review generated DQ plan")
 
     execute_checks = LLMDataQualityOperator(
         task_id="execute_checks",

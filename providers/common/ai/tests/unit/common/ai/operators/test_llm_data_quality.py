@@ -44,7 +44,6 @@ from airflow.providers.common.ai.utils.dq_validation import (
     row_count_check,
 )
 from airflow.providers.common.compat.sdk import AirflowException
-from airflow.sdk.types import TaskInstance
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,7 +57,7 @@ _CHECKS = [
 
 def _make_context():
     """Return a minimal Airflow context with a mock TaskInstance."""
-    mock_ti = MagicMock(spec=TaskInstance)
+    mock_ti = MagicMock()
     return cast("Context", {"ti": mock_ti})
 
 
